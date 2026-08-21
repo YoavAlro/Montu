@@ -75,14 +75,10 @@ matches, all of which must exist in tracked sources.
 Not on PyPI. Pin at an exact commit:
 
 ```bash
-pip install "montu @ git+https://github.com/emerixai/montu@<commit>"
+pip install "montu @ git+https://github.com/YoavAlro/montu@<commit>"
 # or, ad hoc without installing:
-uvx --from git+https://github.com/emerixai/montu@<commit> montu lint
+uvx --from git+https://github.com/YoavAlro/montu@<commit> montu lint
 ```
-
-The repo is private: CI needs a read token
-(`git+https://x-access-token:${TOKEN}@github.com/emerixai/montu@<commit>`); developers'
-normal git credentials suffice.
 
 ## Developing
 

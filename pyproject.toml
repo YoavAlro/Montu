@@ -1,0 +1,23 @@
+[project]
+name = "montu"
+version = "0.1.0"
+description = "Config-driven monitoring-spec engine: lints checked-in monitoring.yaml files against the code they pin, and prints the monitoring estate. Generic core - consuming repos define profiles in montu.toml."
+requires-python = ">=3.12"
+dependencies = [
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+montu = "montu.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["montu"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]

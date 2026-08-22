@@ -1,4 +1,8 @@
-"""Read-only views of the consuming repo: helm names, registries, token existence."""
+"""Read-only views of the consuming repo: subsystem sources, registries, token existence.
+
+All extraction here is pattern-driven from montu.toml — nothing in this module knows any
+particular deployment tooling, framework, or vendor.
+"""
 
 from __future__ import annotations
 
@@ -7,11 +11,6 @@ import os
 import re
 import subprocess
 
-APP_NAME_RE = re.compile(r"^  name:\s*([A-Za-z0-9-]+)\s*$")
-REGISTRY_APP_RE = re.compile(
-    r"TelAppSpec\(\s*[\"']([a-z0-9_]+)[\"']\s*(?:,\s*(?:routing\s*=\s*)?[\"'](direct|broadcast)[\"'])?"
-)
-
 
 def discover_specs(root: str, spec_glob: str) -> list[str]:
     return sorted(
@@ -19,34 +18,36 @@ def discover_specs(root: str, spec_glob: str) -> list[str]:
     )
 
 
-def helm_app_names(root: str, values_glob: str) -> set[str]:
-    """Every helm values file's `app.name` — matched by content, not filename, so a
-    decoupled release name or renamed values file still resolves."""
+def extract_subsystems(root: str, sources_glob: str, pattern: str) -> set[str]:
+    """Subsystem base names, extracted by regex from the files the glob discovers.
+
+    Matched by content, not filename, so a renamed source file still resolves. The
+    pattern's group 1 (or the whole match, if the pattern has no group) is one name.
+    """
+    compiled = re.compile(pattern, re.MULTILINE)
     names: set[str] = set()
-    for values_path in glob.glob(os.path.join(root, values_glob)):
-        in_app_block = False
-        with open(values_path, encoding="utf-8") as handle:
-            for line in handle:
-                if line.startswith("app:"):
-                    in_app_block = True
-                    continue
-                if in_app_block:
-                    if line.strip() and not line.startswith(" "):
-                        break
-                    match = APP_NAME_RE.match(line)
-                    if match:
-                        names.add(match.group(1))
-                        break
+    for source_path in glob.glob(os.path.join(root, sources_glob)):
+        with open(source_path, encoding="utf-8") as handle:
+            names.update(compiled.findall(handle.read()))
     return names
 
 
-def registry_apps(registry_path: str) -> dict[str, str]:
-    """slug -> routing from a TelAppSpec registry module."""
+def registry_entries(registry_path: str, pattern: str, default_routing: str) -> dict[str, str]:
+    """slug -> routing from a registry file, extracted by the profile's pattern.
+
+    Group 1 is the slug; optional group 2 the routing (falls back to default_routing).
+    """
     if not os.path.isfile(registry_path):
         return {}
     with open(registry_path, encoding="utf-8") as handle:
         source = handle.read()
-    return {slug: routing or "direct" for slug, routing in REGISTRY_APP_RE.findall(source)}
+    compiled = re.compile(pattern)
+    entries: dict[str, str] = {}
+    for match in compiled.finditer(source):
+        slug = match.group(1)
+        routing = match.group(2) if compiled.groups >= 2 and match.group(2) else default_routing
+        entries[slug] = routing
+    return entries
 
 
 def token_exists(root: str, token: str, search_globs: tuple[str, ...]) -> bool:

@@ -14,10 +14,7 @@ from dataclasses import dataclass
 import yaml
 
 from montu.config import Config, Profile
-from montu.repo import discover_specs, helm_app_names, registry_apps, token_exists
-
-CODENAME_RE = re.compile(r"\$d\.codeName\s*==\s*'([A-Z0-9_]+)'")
-CUSTOM_REQUIRED = ("name", "dataprime", "condition")
+from montu.repo import discover_specs, extract_subsystems, registry_entries, token_exists
 
 
 @dataclass
@@ -35,7 +32,7 @@ class Finding:
 class Linter:
     def __init__(self, config: Config):
         self.config = config
-        self._helm_names: set[str] | None = None
+        self._subsystem_names: set[str] | None = None
 
     def lint(self, only_paths: list[str] | None = None) -> tuple[list[Finding], int]:
         """Lint every discovered spec (or `only_paths`); returns (findings, spec count)."""
@@ -98,12 +95,13 @@ class Linter:
             err("alerts must be a non-empty list")
             return findings
         valid_kinds = set(profile.kinds) | {"custom"}
+        custom_required = ("name", self.config.custom_query_field, "condition")
         for i, alert in enumerate(alerts):
             kind = (alert or {}).get("kind")
             if kind not in valid_kinds:
                 err(f"alerts[{i}].kind {kind!r} not in {sorted(valid_kinds)} for profile {profile.name!r}")
                 continue
-            required = CUSTOM_REQUIRED if kind == "custom" else profile.kinds[kind].required
+            required = custom_required if kind == "custom" else profile.kinds[kind].required
             for field_name in required:
                 if field_name not in alert or alert.get(field_name) is None:
                     err(f"alerts[{i}] ({kind}) requires {field_name}")
@@ -144,7 +142,9 @@ class Linter:
         findings: list[Finding] = []
         slug = app.get("slug")
         registry_path = os.path.join(os.path.dirname(os.path.dirname(abs_path)), "registry.py")
-        registry = registry_apps(registry_path)
+        registry = registry_entries(
+            registry_path, profile.registry_entry_pattern, profile.registry_default_routing
+        )
         routing = registry.get(slug or "")
         if slug and routing is None:
             findings.append(
@@ -166,20 +166,21 @@ class Linter:
 
     def _check_subsystem(self, app: dict, rel: str, profile: Profile) -> list[Finding]:
         subsystem = app.get("subsystem")
-        if not subsystem or not self.config.helm_values_glob:
+        if not subsystem or not self.config.subsystem_sources_glob:
             return []
-        helm_names = self._helm_names
-        if helm_names is None:
-            helm_names = self._helm_names = helm_app_names(
-                self.config.root, self.config.helm_values_glob
+        names = self._subsystem_names
+        if names is None:
+            names = self._subsystem_names = extract_subsystems(
+                self.config.root, self.config.subsystem_sources_glob, self.config.subsystem_pattern
             )
-        expected = {name + profile.subsystem_suffix for name in helm_names}
+        expected = {name + profile.subsystem_suffix for name in names}
         if subsystem not in expected:
             return [
                 Finding(
                     rel,
                     "E-SUBSYSTEM",
-                    f"{subsystem!r} matches no {self.config.helm_values_glob} app.name — deployment renamed or removed",
+                    f"{subsystem!r} matches no name extracted from {self.config.subsystem_sources_glob} "
+                    "— deployment renamed or removed",
                 )
             ]
         return []
@@ -189,10 +190,10 @@ class Linter:
         for alert in spec.get("alerts") or []:
             kind = (alert or {}).get("kind")
             if kind == "custom":
-                dataprime = alert.get("dataprime") or ""
-                tokens: tuple[str, ...] = tuple(CODENAME_RE.findall(dataprime))
-                for pattern in self.config.dataprime_token_patterns:
-                    tokens += tuple(re.findall(pattern, dataprime))
+                query = alert.get(self.config.custom_query_field) or ""
+                tokens: tuple[str, ...] = ()
+                for pattern in self.config.query_token_patterns:
+                    tokens += tuple(re.findall(pattern, query))
             elif kind in profile.kinds:
                 tokens = profile.kinds[kind].tokens
             else:
@@ -214,12 +215,17 @@ class Linter:
             return []
         covered = {os.path.basename(os.path.dirname(rel)) for rel in spec_rels}
         findings = []
-        for registry_path in discover_specs(self.config.root, profile.registry_glob):
-            for slug in registry_apps(os.path.join(self.config.root, registry_path)):
+        for registry_rel in discover_specs(self.config.root, profile.registry_glob):
+            entries = registry_entries(
+                os.path.join(self.config.root, registry_rel),
+                profile.registry_entry_pattern,
+                profile.registry_default_routing,
+            )
+            for slug in entries:
                 if slug not in covered:
                     findings.append(
                         Finding(
-                            registry_path,
+                            registry_rel,
                             "W-UNMONITORED",
                             f"registered app {slug!r} has no monitoring.yaml",
                             is_error=False,

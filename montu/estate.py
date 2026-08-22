@@ -7,7 +7,7 @@ import os
 import yaml
 
 from montu.config import Config, Profile
-from montu.repo import discover_specs, registry_apps
+from montu.repo import discover_specs, registry_entries
 
 
 def print_estate(config: Config) -> int:
@@ -30,7 +30,13 @@ def _owners(config: Config, profile: Profile, specs_by_slug: dict[str, str]) -> 
     owners = set(specs_by_slug)
     if profile.registry_glob:
         for registry_rel in discover_specs(config.root, profile.registry_glob):
-            owners.update(registry_apps(os.path.join(config.root, registry_rel)))
+            owners.update(
+                registry_entries(
+                    os.path.join(config.root, registry_rel),
+                    profile.registry_entry_pattern,
+                    profile.registry_default_routing,
+                )
+            )
     return sorted(owners)
 
 

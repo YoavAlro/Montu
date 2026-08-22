@@ -1,4 +1,10 @@
-"""montu.toml loading — the consuming repo's declaration of its monitoring contract."""
+"""montu.toml loading — the consuming repo's declaration of its monitoring contract.
+
+The engine is provider-agnostic: it knows nothing about any observability vendor's query
+language, deployment tooling, or naming. Everything provider- or repo-specific — where
+specs live, how subsystems are derived, which tokens queries grep for, what the raw-query
+field is called — is declared here by the consuming repo.
+"""
 
 from __future__ import annotations
 
@@ -27,6 +33,8 @@ class Profile:
     kinds: dict[str, KindSpec] = field(default_factory=dict)
     subsystem_suffix: str = ""
     registry_glob: str = ""
+    registry_entry_pattern: str = ""
+    registry_default_routing: str = ""
     path_tenant_package_prefix: str = ""
     requires_tenant: bool = False
     requires_queue: bool = False
@@ -36,9 +44,11 @@ class Profile:
 @dataclass
 class Config:
     root: str
-    helm_values_glob: str
+    subsystem_sources_glob: str
+    subsystem_pattern: str
     token_search_globs: tuple[str, ...]
-    dataprime_token_patterns: tuple[str, ...]
+    query_token_patterns: tuple[str, ...]
+    custom_query_field: str
     env: str
     profiles: dict[str, Profile]
 
@@ -60,6 +70,11 @@ def load_config(root: str, path: str | None = None) -> Config:
         spec_glob = prof.get("spec_glob")
         if not spec_glob:
             raise ConfigError(f"profile {name!r} has no spec_glob")
+        if prof.get("registry_glob") and not prof.get("registry_entry_pattern"):
+            raise ConfigError(
+                f"profile {name!r} sets registry_glob without registry_entry_pattern "
+                "(a regex whose group 1 is the app slug and optional group 2 the routing)"
+            )
         kinds = {
             kind_name: KindSpec(
                 name=kind_name,
@@ -74,6 +89,8 @@ def load_config(root: str, path: str | None = None) -> Config:
             kinds=kinds,
             subsystem_suffix=prof.get("subsystem_suffix", ""),
             registry_glob=prof.get("registry_glob", ""),
+            registry_entry_pattern=prof.get("registry_entry_pattern", ""),
+            registry_default_routing=prof.get("registry_default_routing", ""),
             path_tenant_package_prefix=prof.get("path_tenant_package_prefix", ""),
             requires_tenant=bool(prof.get("requires_tenant", False)),
             requires_queue=bool(prof.get("requires_queue", False)),
@@ -82,9 +99,11 @@ def load_config(root: str, path: str | None = None) -> Config:
 
     return Config(
         root=root,
-        helm_values_glob=engine.get("helm_values_glob", ""),
+        subsystem_sources_glob=engine.get("subsystem_sources_glob", ""),
+        subsystem_pattern=engine.get("subsystem_pattern", ""),
         token_search_globs=tuple(engine.get("token_search_globs") or ()),
-        dataprime_token_patterns=tuple(engine.get("dataprime_token_patterns") or ()),
+        query_token_patterns=tuple(engine.get("query_token_patterns") or ()),
+        custom_query_field=engine.get("custom_query_field", "query"),
         env=engine.get("env", "production"),
         profiles=profiles,
     )

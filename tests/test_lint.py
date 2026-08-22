@@ -23,15 +23,21 @@ MONTU_TOML = textwrap.dedent(
     version = 1
 
     [engine]
-    helm_values_glob = "helm/*.yaml"
+    subsystem_sources_glob = "helm/*.yaml"
+    subsystem_pattern = "^app:\\\\n  name: ([A-Za-z0-9-]+)$"
     token_search_globs = ["src/**/*.py"]
-    dataprime_token_patterns = ["event=tel_[a-z0-9_]+"]
+    query_token_patterns = [
+        "event=tel_[a-z0-9_]+",
+        "codeName == '([A-Z0-9_]+)'",
+    ]
     env = "production"
 
     [profiles.worker]
     spec_glob = "src/tenants/tenant_*/apps/*/monitoring.yaml"
     subsystem_suffix = "-worker"
     registry_glob = "src/tenants/tenant_*/apps/registry.py"
+    registry_entry_pattern = "TelAppSpec\\\\(\\\\s*[\\"']([a-z0-9_]+)[\\"']\\\\s*(?:,\\\\s*(?:routing\\\\s*=\\\\s*)?[\\"'](direct|broadcast)[\\"'])?"
+    registry_default_routing = "direct"
     path_tenant_package_prefix = "tenant_"
     requires_tenant = true
     requires_queue = true
@@ -73,7 +79,7 @@ WORKER_SPEC = textwrap.dedent(
         runbook: check the worker
       - kind: custom
         name: latency
-        dataprime: "source logs | filter $d.codeName == 'ALPHA_LATENCY'"
+        query: "source logs | filter $d.codeName == 'ALPHA_LATENCY'"
         condition: "count >= 1 in 15m"
         runbook: check latency
     dashboard: true

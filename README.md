@@ -5,8 +5,11 @@ per service/app (the PR-reviewed source of truth for its alerts + dashboard) and
 `montu.toml` declaring where those specs live and what they may contain; montu then
 proves, deterministically and offline, that every spec still matches the code it pins.
 
-The engine is generic — deployment names, routing registries, log-token contracts, and
-alert kinds are all injected from `montu.toml`. Nothing repo-specific lives here.
+**The engine is provider-agnostic and repo-agnostic.** It knows no observability
+vendor's query language, no deployment tooling, no framework: spec locations, profiles,
+alert kinds, subsystem derivation, registry parsing, and the token patterns queries are
+scanned for are all regexes and globs injected from `montu.toml`. The examples below
+bind it to a Coralogix + Helm + Celery stack — swap the patterns for yours.
 
 ## Commands
 
@@ -27,10 +30,10 @@ sits untouched.
 | `E-YAML` | the spec is not parseable YAML |
 | `E-SCHEMA` | required fields missing, invalid alert kind for the profile, wrong `env` |
 | `E-PATH` | `app.slug` / `app.tenant` disagree with where the spec sits |
-| `E-REGISTRY` | the app has no entry in its profile's registry module |
+| `E-REGISTRY` | the app has no entry in its profile's registry file |
 | `E-QUEUE` | `app.queue` disagrees with the registry's routing mode |
-| `E-SUBSYSTEM` | `app.subsystem` matches no helm values file's `app.name` |
-| `E-TOKEN` | an alert references a log token or `$d.codeName` no tracked source defines |
+| `E-SUBSYSTEM` | `app.subsystem` matches no name extracted from the subsystem sources |
+| `E-TOKEN` | an alert references a token no tracked source defines |
 | `W-UNMONITORED` | (warning) a registered app has no spec |
 | `W-NO-RUNBOOK` | (warning) an alert carries no triage instructions |
 
@@ -43,15 +46,35 @@ tracked sources count and the working tree is what's validated.
 version = 1
 
 [engine]
-helm_values_glob = "helm/values/app/*.yaml"   # files whose `app.name` defines subsystems
-token_search_globs = ["py/**/*.py"]            # git-grep pathspecs for token existence
-dataprime_token_patterns = ["event=tel_[a-z0-9_]+"]  # extracted from custom dataprime
-env = "production"                             # the only env specs may declare
+# Files whose content names your deployable units, and the regex (MULTILINE; group 1,
+# or the whole match when the pattern has no group) that extracts each name.
+# Example: helm values files where `app.name` is the k8s deployment / log subsystem.
+subsystem_sources_glob = "helm/values/app/*.yaml"
+subsystem_pattern = "^app:\\n  name: ([A-Za-z0-9-]+)$"
+
+token_search_globs = ["py/**/*.py"]   # git-grep pathspecs for token existence
+
+# Regexes run against a custom alert's raw query; every match (group 1 if the pattern
+# has a group, else the whole match) must exist in tracked sources. Put your query
+# language's referenced-identifier shapes here — e.g. for Coralogix DataPrime:
+query_token_patterns = [
+    "event=tel_[a-z0-9_]+",
+    "\\$d\\.codeName\\s*==\\s*'([A-Z0-9_]+)'",
+]
+
+# What the custom alert's raw-query field is called in specs (default: "query").
+# Name it after your provider's language if you prefer specs to be self-describing:
+custom_query_field = "dataprime"
+
+env = "production"                    # the only env specs may declare
 
 [profiles.<name>]
 spec_glob = "path/glob/to/*/monitoring.yaml"
-subsystem_suffix = "-worker"          # optional: appended to helm app.name for matching
+subsystem_suffix = "-worker"          # optional: appended to extracted names for matching
 registry_glob = "path/glob/registry.py"  # optional: enables E-REGISTRY/E-QUEUE/W-UNMONITORED
+# Regex over the registry file: group 1 = app slug, optional group 2 = routing.
+registry_entry_pattern = "TelAppSpec\\(\\s*[\"']([a-z0-9_]+)[\"'](?:.*?[\"'](direct|broadcast)[\"'])?"
+registry_default_routing = "direct"   # routing when group 2 is absent
 path_tenant_package_prefix = "tenant_"   # optional: enables the tenant path check
 requires_tenant = true                # app.tenant mandatory in this profile
 requires_queue = true                 # app.queue mandatory in this profile
@@ -66,9 +89,9 @@ tokens = ["event=tel_handler_failed"] # tokens this kind's query greps for (E-TO
 ```
 
 A spec's profile is whichever `spec_glob` discovered it — specs carry no profile field.
-The built-in `custom` kind requires `name`, `dataprime`, `condition`; its `dataprime` is
-scanned for `$d.codeName == '<NAME>'` references and for `dataprime_token_patterns`
-matches, all of which must exist in tracked sources.
+The built-in `custom` kind requires `name`, the configured query field, and `condition`;
+its query text is scanned with `query_token_patterns`, and every extracted token must
+exist in tracked sources.
 
 ## Consuming
 

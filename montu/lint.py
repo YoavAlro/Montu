@@ -66,6 +66,27 @@ class Linter:
         findings.extend(self._check_registry_and_queue(app, abs_path, rel, profile))
         findings.extend(self._check_subsystem(app, rel, profile))
         findings.extend(self._check_tokens(spec, rel, profile))
+        findings.extend(self._check_file_refs(spec, abs_path, rel, profile))
+        return findings
+
+    def _check_file_refs(
+        self, spec: dict, abs_path: str, rel: str, profile: Profile
+    ) -> list[Finding]:
+        """Spec fields naming a sibling file (e.g. a dashboard model) must resolve."""
+        findings = []
+        spec_dir = os.path.dirname(abs_path)
+        for field_name in profile.file_ref_fields:
+            referenced = spec.get(field_name)
+            if not referenced:
+                continue
+            if not os.path.isfile(os.path.join(spec_dir, referenced)):
+                findings.append(
+                    Finding(
+                        rel,
+                        "E-FILEREF",
+                        f"{field_name}: {referenced!r} does not exist next to the spec",
+                    )
+                )
         return findings
 
     def _check_schema(self, spec: dict, rel: str, profile: Profile) -> list[Finding]:

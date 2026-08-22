@@ -56,6 +56,7 @@ MONTU_TOML = textwrap.dedent(
 
     [profiles.service]
     spec_glob = "src/services/*/monitoring.yaml"
+    file_ref_fields = ["grafana_dashboard"]
 
     [profiles.service.kinds.error_rate]
     required = ["window_minutes", "threshold"]
@@ -206,6 +207,21 @@ def test_service_profile_rejects_worker_kinds(repo: Path):
     findings, _ = lint(repo)
     schema = [f for f in findings if f.code == "E-SCHEMA"]
     assert any("handler_errors" in f.message for f in schema)
+
+
+def test_missing_file_ref_fails(repo: Path):
+    spec = repo / "src" / "services" / "billing" / "monitoring.yaml"
+    spec.write_text(SERVICE_SPEC + "grafana_dashboard: billing.grafana.json\n")
+    findings, _ = lint(repo)
+    assert "E-FILEREF" in codes(findings)
+
+
+def test_present_file_ref_passes(repo: Path):
+    billing = repo / "src" / "services" / "billing"
+    (billing / "billing.grafana.json").write_text('{"uid": "svc-billing"}')
+    (billing / "monitoring.yaml").write_text(SERVICE_SPEC + "grafana_dashboard: billing.grafana.json\n")
+    findings, _ = lint(repo)
+    assert "E-FILEREF" not in codes(findings)
 
 
 def test_estate_map_prints_gaps_and_coverage(repo: Path, capsys):

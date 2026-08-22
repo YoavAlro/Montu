@@ -34,6 +34,7 @@ sits untouched.
 | `E-QUEUE` | `app.queue` disagrees with the registry's routing mode |
 | `E-SUBSYSTEM` | `app.subsystem` matches no name extracted from the subsystem sources |
 | `E-TOKEN` | an alert references a token no tracked source defines |
+| `E-FILEREF` | a spec field naming a sibling file (e.g. a dashboard model) doesn't resolve |
 | `W-UNMONITORED` | (warning) a registered app has no spec |
 | `W-NO-RUNBOOK` | (warning) an alert carries no triage instructions |
 
@@ -78,6 +79,8 @@ registry_default_routing = "direct"   # routing when group 2 is absent
 path_tenant_package_prefix = "tenant_"   # optional: enables the tenant path check
 requires_tenant = true                # app.tenant mandatory in this profile
 requires_queue = true                 # app.queue mandatory in this profile
+# Spec fields whose value names a file next to the spec; each must exist (E-FILEREF).
+file_ref_fields = ["grafana_dashboard"]
 
 [profiles.<name>.queue_suffix]        # routing -> queue name suffix (E-QUEUE)
 direct = "events"

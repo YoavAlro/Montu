@@ -39,6 +39,7 @@ class Profile:
     requires_tenant: bool = False
     requires_queue: bool = False
     queue_suffix: dict[str, str] = field(default_factory=dict)
+    file_ref_fields: tuple[str, ...] = ()
 
 
 @dataclass
@@ -95,6 +96,7 @@ def load_config(root: str, path: str | None = None) -> Config:
             requires_tenant=bool(prof.get("requires_tenant", False)),
             requires_queue=bool(prof.get("requires_queue", False)),
             queue_suffix=dict(prof.get("queue_suffix") or {}),
+            file_ref_fields=tuple(prof.get("file_ref_fields") or ()),
         )
 
     return Config(

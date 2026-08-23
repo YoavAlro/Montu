@@ -1,4 +1,11 @@
+<p align="center">
+  <img src="assets/logo.svg" alt="" width="104">
+</p>
+
 # montu
+
+Named for the falcon-headed Egyptian god; the mark is his watchful eye — which is the
+whole job here, watching specs and code for drift.
 
 Config-driven monitoring-spec engine. A consuming repo checks in one `monitoring.yaml`
 per service/app (the PR-reviewed source of truth for its alerts + dashboard) and a

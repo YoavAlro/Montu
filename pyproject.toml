@@ -1,6 +1,6 @@
 [project]
 name = "montu"
-version = "0.3.0"
+version = "0.4.0"
 description = "Config-driven monitoring-spec engine: lints checked-in monitoring.yaml files against the code they pin, and prints the monitoring estate. Generic core - consuming repos define profiles in montu.toml."
 requires-python = ">=3.12"
 dependencies = [

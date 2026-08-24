@@ -1,8 +1,8 @@
 """The lint engine: validate every spec against the code it pins.
 
 Always validates ALL specs a profile's glob discovers — never fix-on-touch — because
-drift is usually caused by code changes (a deployment rename, a routing flip, a log-token
-rename) while the spec itself sits untouched.
+drift is usually caused by code changes (a unit rename, a variant flip, a renamed log
+identifier) while the spec itself sits untouched.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from dataclasses import dataclass
 import yaml
 
 from montu.config import Config, Profile
-from montu.repo import discover_specs, extract_subsystems, registry_entries, token_exists
+from montu.repo import discover, extract_units, identifier_exists, read_inventory
 
 
 @dataclass
@@ -32,20 +32,20 @@ class Finding:
 class Linter:
     def __init__(self, config: Config):
         self.config = config
-        self._subsystem_names: set[str] | None = None
+        self._units: set[str] | None = None
 
     def lint(self, only_paths: list[str] | None = None) -> tuple[list[Finding], int]:
         """Lint every discovered spec (or `only_paths`); returns (findings, spec count)."""
         findings: list[Finding] = []
         total = 0
         for profile in self.config.profiles.values():
-            spec_rels = discover_specs(self.config.root, profile.spec_glob)
+            spec_rels = discover(self.config.root, profile.spec_glob)
             if only_paths is not None:
                 spec_rels = [rel for rel in spec_rels if rel in only_paths]
             total += len(spec_rels)
             for rel in spec_rels:
                 findings.extend(self._lint_spec(rel, profile))
-            findings.extend(self._unmonitored(profile, spec_rels))
+            findings.extend(self._uncovered(profile, spec_rels))
         return findings, total
 
     # --- per-spec checks -------------------------------------------------------
@@ -60,36 +60,16 @@ class Linter:
         if not isinstance(spec, dict):
             return [Finding(rel, "E-YAML", "top level must be a mapping")]
 
-        findings = self._check_schema(spec, rel, profile)
         app = spec.get("app") or {}
-        findings.extend(self._check_path(app, abs_path, rel, profile))
-        findings.extend(self._check_registry_and_queue(app, abs_path, rel, profile))
-        findings.extend(self._check_subsystem(app, rel, profile))
-        findings.extend(self._check_tokens(spec, rel, profile))
+        findings = self._check_schema(spec, app, rel, profile)
+        findings.extend(self._check_paths(app, abs_path, rel, profile))
+        findings.extend(self._check_inventory_and_fields(app, abs_path, rel, profile))
+        findings.extend(self._check_unit(app, rel, profile))
+        findings.extend(self._check_identifiers(spec, rel, profile))
         findings.extend(self._check_file_refs(spec, abs_path, rel, profile))
         return findings
 
-    def _check_file_refs(
-        self, spec: dict, abs_path: str, rel: str, profile: Profile
-    ) -> list[Finding]:
-        """Spec fields naming a sibling file (e.g. a dashboard model) must resolve."""
-        findings = []
-        spec_dir = os.path.dirname(abs_path)
-        for field_name in profile.file_ref_fields:
-            referenced = spec.get(field_name)
-            if not referenced:
-                continue
-            if not os.path.isfile(os.path.join(spec_dir, referenced)):
-                findings.append(
-                    Finding(
-                        rel,
-                        "E-FILEREF",
-                        f"{field_name}: {referenced!r} does not exist next to the spec",
-                    )
-                )
-        return findings
-
-    def _check_schema(self, spec: dict, rel: str, profile: Profile) -> list[Finding]:
+    def _check_schema(self, spec: dict, app: dict, rel: str, profile: Profile) -> list[Finding]:
         findings: list[Finding] = []
 
         def err(msg: str) -> None:
@@ -97,13 +77,8 @@ class Linter:
 
         if spec.get("version") != 1:
             err("version must be 1")
-        app = spec.get("app") or {}
-        required_app = ["slug", "subsystem"]
-        if profile.requires_tenant:
-            required_app.append("tenant")
-        if profile.requires_queue:
-            required_app.append("queue")
-        for field_name in required_app:
+        required = {self.config.id_field, self.config.unit_field, *profile.required_fields}
+        for field_name in sorted(required):
             if not isinstance(app.get(field_name), str) or not app.get(field_name):
                 err(f"app.{field_name} is required and must be a non-empty string")
         if spec.get("env") != self.config.env:
@@ -122,8 +97,7 @@ class Linter:
             if kind not in valid_kinds:
                 err(f"alerts[{i}].kind {kind!r} not in {sorted(valid_kinds)} for profile {profile.name!r}")
                 continue
-            required = custom_required if kind == "custom" else profile.kinds[kind].required
-            for field_name in required:
+            for field_name in custom_required if kind == "custom" else profile.kinds[kind].required:
                 if field_name not in alert or alert.get(field_name) is None:
                     err(f"alerts[{i}] ({kind}) requires {field_name}")
             if not (alert.get("runbook") or "").strip():
@@ -138,118 +112,171 @@ class Linter:
                 )
         return findings
 
-    def _check_path(self, app: dict, abs_path: str, rel: str, profile: Profile) -> list[Finding]:
-        findings: list[Finding] = []
-        slug = app.get("slug")
-        app_dir = os.path.dirname(abs_path)
-        if slug and os.path.basename(app_dir) != slug:
-            findings.append(
-                Finding(rel, "E-PATH", f"app.slug {slug!r} != containing dir {os.path.basename(app_dir)!r}")
-            )
-        if profile.path_tenant_package_prefix and app.get("tenant"):
-            tenant_pkg = os.path.basename(os.path.dirname(os.path.dirname(app_dir)))
-            expected = f"{profile.path_tenant_package_prefix}{app['tenant']}"
-            if tenant_pkg != expected:
+    def _check_paths(self, app: dict, abs_path: str, rel: str, profile: Profile) -> list[Finding]:
+        """Spec fields that must agree with where the spec sits in the tree."""
+        findings = []
+        spec_dir = os.path.dirname(abs_path)
+        for rule in profile.path_rules:
+            value = app.get(rule.spec_field)
+            if not value:
+                continue
+            directory = spec_dir
+            for _ in range(rule.ancestor):
+                directory = os.path.dirname(directory)
+            actual = os.path.basename(directory)
+            if actual != f"{rule.prefix}{value}":
                 findings.append(
-                    Finding(rel, "E-PATH", f"app.tenant {app['tenant']!r} != containing package {tenant_pkg!r}")
+                    Finding(
+                        rel,
+                        "E-PATH",
+                        f"app.{rule.spec_field} {value!r} disagrees with the directory "
+                        f"{rule.ancestor} level(s) up ({actual!r}, expected "
+                        f"{rule.prefix + str(value)!r})",
+                    )
                 )
         return findings
 
-    def _check_registry_and_queue(
+    def _check_inventory_and_fields(
         self, app: dict, abs_path: str, rel: str, profile: Profile
     ) -> list[Finding]:
-        if not profile.registry_glob:
+        """Owner listed in the inventory, and fields derived from its id + variant."""
+        if profile.inventory is None:
             return []
         findings: list[Finding] = []
-        slug = app.get("slug")
-        registry_path = os.path.join(os.path.dirname(os.path.dirname(abs_path)), "registry.py")
-        registry = registry_entries(
-            registry_path, profile.registry_entry_pattern, profile.registry_default_routing
+        owner_id = app.get(self.config.id_field)
+        inventory_path = self._inventory_for(abs_path, profile)
+        entries = read_inventory(
+            inventory_path, profile.inventory.entry_pattern, profile.inventory.default_variant
         )
-        routing = registry.get(slug or "")
-        if slug and routing is None:
+        variant = entries.get(owner_id or "")
+        if owner_id and variant is None:
             findings.append(
-                Finding(rel, "E-REGISTRY", f"{slug!r} has no entry in the profile's registry ({os.path.relpath(registry_path, self.config.root)})")
+                Finding(
+                    rel,
+                    "E-INVENTORY",
+                    f"{owner_id!r} has no entry in "
+                    f"{os.path.relpath(inventory_path, self.config.root)}",
+                )
             )
-        elif slug and routing and profile.queue_suffix:
-            suffix = profile.queue_suffix.get(routing)
-            if suffix:
-                expected_queue = f"{slug}.{suffix}"
-                if app.get("queue") != expected_queue:
-                    findings.append(
-                        Finding(
-                            rel,
-                            "E-QUEUE",
-                            f"app.queue {app.get('queue')!r} != {expected_queue!r} (registry routing is {routing!r})",
-                        )
+            return findings
+
+        for spec_field, template in profile.field_rules.items():
+            expected = template.format(
+                id=owner_id, variant=profile.variant_values.get(variant or "", variant or "")
+            )
+            if app.get(spec_field) != expected:
+                findings.append(
+                    Finding(
+                        rel,
+                        "E-FIELD",
+                        f"app.{spec_field} {app.get(spec_field)!r} != {expected!r} "
+                        f"(inventory variant is {variant!r})",
                     )
+                )
         return findings
 
-    def _check_subsystem(self, app: dict, rel: str, profile: Profile) -> list[Finding]:
-        subsystem = app.get("subsystem")
-        if not subsystem or not self.config.subsystem_sources_glob:
+    def _check_unit(self, app: dict, rel: str, profile: Profile) -> list[Finding]:
+        unit = app.get(self.config.unit_field)
+        if not unit or not self.config.unit_sources_glob:
             return []
-        names = self._subsystem_names
-        if names is None:
-            names = self._subsystem_names = extract_subsystems(
-                self.config.root, self.config.subsystem_sources_glob, self.config.subsystem_pattern
+        units = self._units
+        if units is None:
+            units = self._units = extract_units(
+                self.config.root, self.config.unit_sources_glob, self.config.unit_pattern
             )
-        expected = {name + profile.subsystem_suffix for name in names}
-        if subsystem not in expected:
+        if unit not in {name + profile.unit_suffix for name in units}:
             return [
                 Finding(
                     rel,
-                    "E-SUBSYSTEM",
-                    f"{subsystem!r} matches no name extracted from {self.config.subsystem_sources_glob} "
-                    "— deployment renamed or removed",
+                    "E-UNIT",
+                    f"{unit!r} matches no name extracted from "
+                    f"{self.config.unit_sources_glob} — renamed or removed",
                 )
             ]
         return []
 
-    def _check_tokens(self, spec: dict, rel: str, profile: Profile) -> list[Finding]:
+    def _check_identifiers(self, spec: dict, rel: str, profile: Profile) -> list[Finding]:
+        """Every identifier an alert's query references must exist in tracked sources."""
         findings: list[Finding] = []
         for alert in spec.get("alerts") or []:
             kind = (alert or {}).get("kind")
             if kind == "custom":
                 query = alert.get(self.config.custom_query_field) or ""
-                tokens: tuple[str, ...] = ()
-                for pattern in self.config.query_token_patterns:
-                    tokens += tuple(re.findall(pattern, query))
+                identifiers: tuple[str, ...] = ()
+                for pattern in self.config.query_identifier_patterns:
+                    identifiers += tuple(re.findall(pattern, query))
             elif kind in profile.kinds:
-                tokens = profile.kinds[kind].tokens
+                identifiers = profile.kinds[kind].tokens
             else:
                 continue
-            for token in tokens:
-                if not token_exists(self.config.root, token, self.config.token_search_globs):
+            for identifier in identifiers:
+                if not identifier_exists(self.config.root, identifier, self.config.source_globs):
                     findings.append(
                         Finding(
                             rel,
                             "E-TOKEN",
-                            f"alert kind {kind!r} references '{token}' but no tracked source "
-                            "defines it — renamed? Update the emitting code or the spec (and re-apply)",
+                            f"alert kind {kind!r} references '{identifier}' but no tracked "
+                            "source defines it — renamed? Update the emitting code or the "
+                            "spec (and re-apply)",
                         )
                     )
         return findings
 
-    def _unmonitored(self, profile: Profile, spec_rels: list[str]) -> list[Finding]:
-        if not profile.registry_glob:
+    def _check_file_refs(
+        self, spec: dict, abs_path: str, rel: str, profile: Profile
+    ) -> list[Finding]:
+        """Spec fields naming a sibling file (e.g. a dashboard model) must resolve."""
+        findings = []
+        spec_dir = os.path.dirname(abs_path)
+        for field_name in profile.file_ref_fields:
+            referenced = spec.get(field_name)
+            if referenced and not os.path.isfile(os.path.join(spec_dir, referenced)):
+                findings.append(
+                    Finding(
+                        rel,
+                        "E-FILEREF",
+                        f"{field_name}: {referenced!r} does not exist next to the spec",
+                    )
+                )
+        return findings
+
+    def _uncovered(self, profile: Profile, spec_rels: list[str]) -> list[Finding]:
+        """Owners the inventory lists that no spec covers."""
+        if profile.inventory is None:
             return []
         covered = {os.path.basename(os.path.dirname(rel)) for rel in spec_rels}
         findings = []
-        for registry_rel in discover_specs(self.config.root, profile.registry_glob):
-            entries = registry_entries(
-                os.path.join(self.config.root, registry_rel),
-                profile.registry_entry_pattern,
-                profile.registry_default_routing,
+        for inventory_rel in discover(self.config.root, profile.inventory.glob):
+            entries = read_inventory(
+                os.path.join(self.config.root, inventory_rel),
+                profile.inventory.entry_pattern,
+                profile.inventory.default_variant,
             )
-            for slug in entries:
-                if slug not in covered:
+            for owner_id in entries:
+                if owner_id not in covered:
                     findings.append(
                         Finding(
-                            registry_rel,
+                            inventory_rel,
                             "W-UNMONITORED",
-                            f"registered app {slug!r} has no monitoring.yaml",
+                            f"{owner_id!r} is in the inventory but has no spec",
                             is_error=False,
                         )
                     )
         return findings
+
+    def _inventory_for(self, spec_abs_path: str, profile: Profile) -> str:
+        """The inventory file governing this spec: the nearest match walking upward."""
+        assert profile.inventory is not None
+        candidates = {
+            os.path.join(self.config.root, rel)
+            for rel in discover(self.config.root, profile.inventory.glob)
+        }
+        directory = os.path.dirname(spec_abs_path)
+        while True:
+            for candidate in candidates:
+                if os.path.dirname(candidate) == directory:
+                    return candidate
+            parent = os.path.dirname(directory)
+            if parent == directory:
+                return next(iter(sorted(candidates)), "")
+            directory = parent

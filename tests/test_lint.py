@@ -1,9 +1,9 @@
 """Engine tests against a synthetic consuming repo built in tmp_path.
 
-The fixture repo mirrors the shape montu is configured for in production use: a
-worker-profile app with a registry, a plain service-profile app, helm values files, and
-tracked sources emitting the tokens/codeNames the specs reference. Token existence uses
-`git grep`, so the fixture is a real git repo with tracked files.
+The fixture deliberately models a stack montu has never seen — a made-up "cells"
+inventory with `steady`/`burst` variants — so the tests prove the engine is driven
+entirely by montu.toml and carries no assumptions about any real repo's conventions.
+Identifier existence uses `git grep`, so the fixture is a real git repo.
 """
 
 from __future__ import annotations
@@ -23,83 +23,93 @@ MONTU_TOML = textwrap.dedent(
     version = 1
 
     [engine]
-    subsystem_sources_glob = "helm/*.yaml"
-    subsystem_pattern = "^app:\\\\n  name: ([A-Za-z0-9-]+)$"
-    token_search_globs = ["src/**/*.py"]
-    query_token_patterns = [
-        "event=tel_[a-z0-9_]+",
-        "codeName == '([A-Z0-9_]+)'",
-    ]
+    unit_sources_glob = "deploy/*.yaml"
+    unit_pattern = "^service: ([a-z0-9-]+)$"
+    source_globs = ["src/**/*.py"]
+    query_identifier_patterns = ["marker=[a-z0-9_]+", "code == '([A-Z0-9_]+)'"]
+    custom_query_field = "query"
+    id_field = "slug"
+    unit_field = "unit"
     env = "production"
 
-    [profiles.worker]
-    spec_glob = "src/tenants/tenant_*/apps/*/monitoring.yaml"
-    subsystem_suffix = "-worker"
-    registry_glob = "src/tenants/tenant_*/apps/registry.py"
-    registry_entry_pattern = "TelAppSpec\\\\(\\\\s*[\\"']([a-z0-9_]+)[\\"']\\\\s*(?:,\\\\s*(?:routing\\\\s*=\\\\s*)?[\\"'](direct|broadcast)[\\"'])?"
-    registry_default_routing = "direct"
-    path_tenant_package_prefix = "tenant_"
-    requires_tenant = true
-    requires_queue = true
+    [profiles.cell]
+    spec_glob = "src/regions/region_*/cells/*/monitoring.yaml"
+    unit_suffix = "-cell"
+    required_fields = ["region", "channel"]
 
-    [profiles.worker.queue_suffix]
-    direct = "events"
-    broadcast = "broadcast"
+    [profiles.cell.inventory]
+    glob = "src/regions/region_*/cells/inventory.txt"
+    entry_pattern = "^cell ([a-z0-9_]+)(?: ([a-z]+))?$"
+    default_variant = "steady"
 
-    [profiles.worker.kinds.handler_errors]
+    [[profiles.cell.path_rules]]
+    field = "slug"
+
+    [[profiles.cell.path_rules]]
+    field = "region"
+    ancestor = 2
+    prefix = "region_"
+
+    [profiles.cell.field_rules]
+    channel = "{id}.{variant}"
+
+    [profiles.cell.variant_values]
+    steady = "stream"
+    burst = "batch"
+
+    [profiles.cell.kinds.failures]
     required = ["window_minutes", "threshold"]
-    tokens = ["event=tel_handler_failed"]
+    tokens = ["marker=cell_failed"]
 
-    [profiles.worker.kinds.flow_silence]
-    required = ["window_minutes", "threshold"]
-    tokens = ["event=tel_task_received"]
+    [profiles.plain]
+    spec_glob = "src/tools/*/monitoring.yaml"
+    file_ref_fields = ["dashboard_model"]
 
-    [profiles.service]
-    spec_glob = "src/services/*/monitoring.yaml"
-    file_ref_fields = ["grafana_dashboard"]
+    [[profiles.plain.path_rules]]
+    field = "slug"
 
-    [profiles.service.kinds.error_rate]
+    [profiles.plain.kinds.error_rate]
     required = ["window_minutes", "threshold"]
     """
 )
 
-WORKER_SPEC = textwrap.dedent(
+CELL_SPEC = textwrap.dedent(
     """
     version: 1
     app:
-      tenant: acme
-      slug: alpha_app
-      subsystem: tenant-acme-alpha-app-worker
-      queue: alpha_app.events
+      region: north
+      slug: alpha_cell
+      unit: north-alpha-cell
+      channel: alpha_cell.stream
     env: production
     slack_channel: "#alpha"
     alerts:
-      - kind: handler_errors
+      - kind: failures
         window_minutes: 15
         threshold: 5
-        runbook: check the worker
+        runbook: check the cell
       - kind: custom
         name: latency
-        query: "source logs | filter $d.codeName == 'ALPHA_LATENCY'"
+        query: "source logs | filter code == 'ALPHA_LATENCY'"
         condition: "count >= 1 in 15m"
         runbook: check latency
     dashboard: true
     """
 )
 
-SERVICE_SPEC = textwrap.dedent(
+PLAIN_SPEC = textwrap.dedent(
     """
     version: 1
     app:
-      slug: billing
-      subsystem: billing-service
+      slug: widget
+      unit: widget-tool
     env: production
-    slack_channel: "#billing"
+    slack_channel: "#widget"
     alerts:
       - kind: error_rate
         window_minutes: 15
         threshold: 10
-        runbook: check billing errors
+        runbook: check widget errors
     dashboard: true
     """
 )
@@ -108,126 +118,142 @@ SERVICE_SPEC = textwrap.dedent(
 @pytest.fixture()
 def repo(tmp_path: Path) -> Path:
     (tmp_path / "montu.toml").write_text(MONTU_TOML)
-    (tmp_path / "helm").mkdir()
-    (tmp_path / "helm" / "alpha.yaml").write_text("app:\n  name: tenant-acme-alpha-app\n")
-    (tmp_path / "helm" / "billing.yaml").write_text("app:\n  name: billing-service\n")
+    (tmp_path / "deploy").mkdir()
+    (tmp_path / "deploy" / "a.yaml").write_text("service: north-alpha\n")
+    (tmp_path / "deploy" / "b.yaml").write_text("service: widget-tool\n")
 
-    apps = tmp_path / "src" / "tenants" / "tenant_acme" / "apps"
-    (apps / "alpha_app").mkdir(parents=True)
-    (apps / "alpha_app" / "monitoring.yaml").write_text(WORKER_SPEC)
-    (apps / "registry.py").write_text(
-        'TEL_APPS = (TelAppSpec("alpha_app", routing="direct"), TelAppSpec("ghost_app", routing="broadcast"))\n'
-    )
-    (apps / "worker_lib.py").write_text(
-        'log("event=tel_handler_failed")\nlog("event=tel_task_received")\nALPHA_LATENCY = 1\n'
-    )
+    cells = tmp_path / "src" / "regions" / "region_north" / "cells"
+    (cells / "alpha_cell").mkdir(parents=True)
+    (cells / "alpha_cell" / "monitoring.yaml").write_text(CELL_SPEC)
+    (cells / "inventory.txt").write_text("cell alpha_cell steady\ncell ghost_cell burst\n")
 
-    billing = tmp_path / "src" / "services" / "billing"
-    billing.mkdir(parents=True)
-    (billing / "monitoring.yaml").write_text(SERVICE_SPEC)
+    src = tmp_path / "src" / "lib"
+    src.mkdir(parents=True)
+    (src / "emit.py").write_text('log("marker=cell_failed")\nALPHA_LATENCY = 1\n')
+
+    tool = tmp_path / "src" / "tools" / "widget"
+    tool.mkdir(parents=True)
+    (tool / "monitoring.yaml").write_text(PLAIN_SPEC)
 
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
     subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
     return tmp_path
 
 
-def lint(repo_path: Path) -> tuple[list, int]:
-    config = load_config(str(repo_path))
-    return Linter(config).lint()
+def lint(repo_path: Path):
+    return Linter(load_config(str(repo_path))).lint()
 
 
-def codes(findings: list) -> set[str]:
+def codes(findings) -> set[str]:
     return {f.code for f in findings}
 
 
-def test_clean_repo_has_only_the_unmonitored_warning(repo: Path):
+def restage(repo_path: Path) -> None:
+    subprocess.run(["git", "add", "-A"], cwd=repo_path, check=True)
+
+
+def test_clean_repo_has_only_the_uncovered_warning(repo: Path):
     findings, total = lint(repo)
     assert total == 2
-    errors = [f for f in findings if f.is_error]
-    assert errors == []
-    assert codes(findings) == {"W-UNMONITORED"}  # ghost_app is registered, unspecced
+    assert [f for f in findings if f.is_error] == []
+    assert codes(findings) == {"W-UNMONITORED"}  # ghost_cell is inventoried, unspecced
 
 
-def test_subsystem_drift_fails(repo: Path):
-    helm = repo / "helm" / "alpha.yaml"
-    helm.write_text("app:\n  name: tenant-acme-alpha-renamed\n")
+def test_unit_rename_fails(repo: Path):
+    (repo / "deploy" / "a.yaml").write_text("service: north-renamed\n")
     findings, _ = lint(repo)
-    assert "E-SUBSYSTEM" in codes(findings)
+    assert "E-UNIT" in codes(findings)
 
 
-def test_queue_vs_routing_drift_fails(repo: Path):
-    registry = repo / "src" / "tenants" / "tenant_acme" / "apps" / "registry.py"
-    registry.write_text('TEL_APPS = (TelAppSpec("alpha_app", routing="broadcast"),)\n')
-    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+def test_derived_field_disagrees_with_variant(repo: Path):
+    inv = repo / "src" / "regions" / "region_north" / "cells" / "inventory.txt"
+    inv.write_text("cell alpha_cell burst\n")   # channel should become alpha_cell.batch
+    restage(repo)
     findings, _ = lint(repo)
-    assert "E-QUEUE" in codes(findings)
+    assert "E-FIELD" in codes(findings)
 
 
-def test_renamed_token_fails(repo: Path):
-    lib = repo / "src" / "tenants" / "tenant_acme" / "apps" / "worker_lib.py"
-    lib.write_text('log("event=tel_handler_broke")\nALPHA_LATENCY = 1\n')
-    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+def test_default_variant_applies_when_group_absent(repo: Path):
+    inv = repo / "src" / "regions" / "region_north" / "cells" / "inventory.txt"
+    inv.write_text("cell alpha_cell\n")          # no variant -> default steady -> .stream
+    restage(repo)
     findings, _ = lint(repo)
-    token_errors = [f for f in findings if f.code == "E-TOKEN"]
-    assert any("event=tel_handler_failed" in f.message for f in token_errors)
+    assert "E-FIELD" not in codes(findings)
 
 
-def test_renamed_codename_fails(repo: Path):
-    lib = repo / "src" / "tenants" / "tenant_acme" / "apps" / "worker_lib.py"
-    lib.write_text('log("event=tel_handler_failed")\nlog("event=tel_task_received")\n')
-    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+def test_renamed_kind_token_fails(repo: Path):
+    (repo / "src" / "lib" / "emit.py").write_text('log("marker=cell_broke")\nALPHA_LATENCY = 1\n')
+    restage(repo)
     findings, _ = lint(repo)
-    token_errors = [f for f in findings if f.code == "E-TOKEN"]
-    assert any("ALPHA_LATENCY" in f.message for f in token_errors)
+    assert any("marker=cell_failed" in f.message for f in findings if f.code == "E-TOKEN")
 
 
-def test_wrong_env_and_missing_registry_entry_fail(repo: Path):
-    spec = repo / "src" / "tenants" / "tenant_acme" / "apps" / "alpha_app" / "monitoring.yaml"
-    spec.write_text(WORKER_SPEC.replace("env: production", "env: staging"))
-    registry = repo / "src" / "tenants" / "tenant_acme" / "apps" / "registry.py"
-    registry.write_text("TEL_APPS = ()\n")
-    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+def test_renamed_query_identifier_fails(repo: Path):
+    (repo / "src" / "lib" / "emit.py").write_text('log("marker=cell_failed")\n')
+    restage(repo)
     findings, _ = lint(repo)
-    assert {"E-SCHEMA", "E-REGISTRY"} <= codes(findings)
+    assert any("ALPHA_LATENCY" in f.message for f in findings if f.code == "E-TOKEN")
+
+
+def test_ancestor_path_rule_fails(repo: Path):
+    spec = repo / "src" / "regions" / "region_north" / "cells" / "alpha_cell" / "monitoring.yaml"
+    spec.write_text(CELL_SPEC.replace("region: north", "region: south"))
+    findings, _ = lint(repo)
+    assert any("region" in f.message for f in findings if f.code == "E-PATH")
+
+
+def test_wrong_env_and_missing_inventory_entry_fail(repo: Path):
+    spec = repo / "src" / "regions" / "region_north" / "cells" / "alpha_cell" / "monitoring.yaml"
+    spec.write_text(CELL_SPEC.replace("env: production", "env: staging"))
+    inv = repo / "src" / "regions" / "region_north" / "cells" / "inventory.txt"
+    inv.write_text("")
+    restage(repo)
+    findings, _ = lint(repo)
+    assert {"E-SCHEMA", "E-INVENTORY"} <= codes(findings)
+
+
+def test_required_fields_are_per_profile(repo: Path):
+    """`region`/`channel` are required for cells; the plain profile must not need them."""
+    spec = repo / "src" / "tools" / "widget" / "monitoring.yaml"
+    findings, _ = lint(repo)
+    assert not [f for f in findings if f.is_error and str(spec).endswith(f.path)]
+
+
+def test_profile_rejects_another_profiles_kind(repo: Path):
+    spec = repo / "src" / "tools" / "widget" / "monitoring.yaml"
+    spec.write_text(PLAIN_SPEC.replace("kind: error_rate", "kind: failures"))
+    findings, _ = lint(repo)
+    assert any("failures" in f.message for f in findings if f.code == "E-SCHEMA")
 
 
 def test_missing_runbook_warns_but_does_not_fail(repo: Path):
-    spec = repo / "src" / "services" / "billing" / "monitoring.yaml"
-    stripped = SERVICE_SPEC.replace("    runbook: check billing errors\n", "")
-    assert stripped != SERVICE_SPEC
+    spec = repo / "src" / "tools" / "widget" / "monitoring.yaml"
+    stripped = PLAIN_SPEC.replace("    runbook: check widget errors\n", "")
+    assert stripped != PLAIN_SPEC
     spec.write_text(stripped)
     findings, _ = lint(repo)
     runbook = [f for f in findings if f.code == "W-NO-RUNBOOK"]
     assert runbook and not any(f.is_error for f in runbook)
 
 
-def test_service_profile_rejects_worker_kinds(repo: Path):
-    spec = repo / "src" / "services" / "billing" / "monitoring.yaml"
-    spec.write_text(SERVICE_SPEC.replace("kind: error_rate", "kind: handler_errors"))
-    findings, _ = lint(repo)
-    schema = [f for f in findings if f.code == "E-SCHEMA"]
-    assert any("handler_errors" in f.message for f in schema)
-
-
 def test_missing_file_ref_fails(repo: Path):
-    spec = repo / "src" / "services" / "billing" / "monitoring.yaml"
-    spec.write_text(SERVICE_SPEC + "grafana_dashboard: billing.grafana.json\n")
+    spec = repo / "src" / "tools" / "widget" / "monitoring.yaml"
+    spec.write_text(PLAIN_SPEC + "dashboard_model: widget.dashboard.json\n")
     findings, _ = lint(repo)
     assert "E-FILEREF" in codes(findings)
 
 
 def test_present_file_ref_passes(repo: Path):
-    billing = repo / "src" / "services" / "billing"
-    (billing / "billing.grafana.json").write_text('{"uid": "svc-billing"}')
-    (billing / "monitoring.yaml").write_text(SERVICE_SPEC + "grafana_dashboard: billing.grafana.json\n")
+    tool = repo / "src" / "tools" / "widget"
+    (tool / "widget.dashboard.json").write_text('{"uid": "widget"}')
+    (tool / "monitoring.yaml").write_text(PLAIN_SPEC + "dashboard_model: widget.dashboard.json\n")
     findings, _ = lint(repo)
     assert "E-FILEREF" not in codes(findings)
 
 
 def test_estate_map_prints_gaps_and_coverage(repo: Path, capsys):
-    config = load_config(str(repo))
-    print_estate(config)
+    print_estate(load_config(str(repo)))
     out = capsys.readouterr().out
-    assert "ghost_app: UNMONITORED" in out
-    assert "billing: src/services/billing/monitoring.yaml" in out
+    assert "ghost_cell: UNMONITORED" in out
+    assert "widget: src/tools/widget/monitoring.yaml" in out
     assert "1/1 runbooks" in out

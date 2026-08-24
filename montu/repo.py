@@ -1,7 +1,7 @@
-"""Read-only views of the consuming repo: subsystem sources, registries, token existence.
+"""Read-only views of the consuming repo: unit names, inventories, identifier existence.
 
-All extraction here is pattern-driven from montu.toml — nothing in this module knows any
-particular deployment tooling, framework, or vendor.
+Every extraction here is pattern-driven from montu.toml. Nothing in this module knows
+any deployment tool, framework, or vendor.
 """
 
 from __future__ import annotations
@@ -12,17 +12,18 @@ import re
 import subprocess
 
 
-def discover_specs(root: str, spec_glob: str) -> list[str]:
+def discover(root: str, pattern_glob: str) -> list[str]:
+    """Repo-relative paths matching a glob, sorted."""
     return sorted(
-        os.path.relpath(p, root) for p in glob.glob(os.path.join(root, spec_glob))
+        os.path.relpath(p, root) for p in glob.glob(os.path.join(root, pattern_glob))
     )
 
 
-def extract_subsystems(root: str, sources_glob: str, pattern: str) -> set[str]:
-    """Subsystem base names, extracted by regex from the files the glob discovers.
+def extract_units(root: str, sources_glob: str, pattern: str) -> set[str]:
+    """Deployable-unit names, extracted by regex from the files the glob discovers.
 
     Matched by content, not filename, so a renamed source file still resolves. The
-    pattern's group 1 (or the whole match, if the pattern has no group) is one name.
+    pattern's group 1 (or the whole match, if it has no group) is one name.
     """
     compiled = re.compile(pattern, re.MULTILINE)
     names: set[str] = set()
@@ -32,28 +33,29 @@ def extract_subsystems(root: str, sources_glob: str, pattern: str) -> set[str]:
     return names
 
 
-def registry_entries(registry_path: str, pattern: str, default_routing: str) -> dict[str, str]:
-    """slug -> routing from a registry file, extracted by the profile's pattern.
+def read_inventory(path: str, entry_pattern: str, default_variant: str) -> dict[str, str]:
+    """owner id -> variant, extracted from an inventory file by the profile's pattern.
 
-    Group 1 is the slug; optional group 2 the routing (falls back to default_routing).
+    Group 1 is the owner id; optional group 2 the variant (falling back to the
+    profile's default_variant).
     """
-    if not os.path.isfile(registry_path):
+    if not os.path.isfile(path):
         return {}
-    with open(registry_path, encoding="utf-8") as handle:
+    with open(path, encoding="utf-8") as handle:
         source = handle.read()
-    compiled = re.compile(pattern)
+    # MULTILINE so line-anchored patterns (^entry$) work — inventories are line-oriented.
+    compiled = re.compile(entry_pattern, re.MULTILINE)
     entries: dict[str, str] = {}
     for match in compiled.finditer(source):
-        slug = match.group(1)
-        routing = match.group(2) if compiled.groups >= 2 and match.group(2) else default_routing
-        entries[slug] = routing
+        variant = match.group(2) if compiled.groups >= 2 and match.group(2) else default_variant
+        entries[match.group(1)] = variant
     return entries
 
 
-def token_exists(root: str, token: str, search_globs: tuple[str, ...]) -> bool:
-    """True when the literal token appears in tracked sources matching the globs."""
+def identifier_exists(root: str, identifier: str, source_globs: tuple[str, ...]) -> bool:
+    """True when the literal identifier appears in tracked sources matching the globs."""
     result = subprocess.run(
-        ["git", "grep", "-q", "--fixed-strings", token, "--", *search_globs],
+        ["git", "grep", "-q", "--fixed-strings", identifier, "--", *source_globs],
         cwd=root,
         capture_output=True,
     )

@@ -1,9 +1,15 @@
 """montu.toml loading — the consuming repo's declaration of its monitoring contract.
 
-The engine is provider-agnostic: it knows nothing about any observability vendor's query
-language, deployment tooling, or naming. Everything provider- or repo-specific — where
-specs live, how subsystems are derived, which tokens queries grep for, what the raw-query
-field is called — is declared here by the consuming repo.
+The engine is deliberately vocabulary-neutral: it knows nothing about any observability
+vendor, deployment tool, or framework, and nothing about how a particular repo models
+its services. Every name it matches on, every path it resolves, and every field it
+requires is declared by the consuming repo.
+
+Concepts, all generic:
+  unit        a deployable thing whose name appears in the telemetry backend
+  owner       whatever a single spec covers (a service, an app, a worker)
+  inventory   an optional file listing the owners a profile should cover
+  variant     an optional per-owner mode recorded in the inventory
 """
 
 from __future__ import annotations
@@ -27,29 +33,47 @@ class KindSpec:
 
 
 @dataclass
+class Inventory:
+    """A file enumerating the owners a profile should cover."""
+
+    glob: str
+    entry_pattern: str
+    default_variant: str = ""
+
+
+@dataclass
+class PathRule:
+    """Assert a spec field matches an ancestor directory of the spec file."""
+
+    spec_field: str
+    ancestor: int = 0
+    prefix: str = ""
+
+
+@dataclass
 class Profile:
     name: str
     spec_glob: str
     kinds: dict[str, KindSpec] = field(default_factory=dict)
-    subsystem_suffix: str = ""
-    registry_glob: str = ""
-    registry_entry_pattern: str = ""
-    registry_default_routing: str = ""
-    path_tenant_package_prefix: str = ""
-    requires_tenant: bool = False
-    requires_queue: bool = False
-    queue_suffix: dict[str, str] = field(default_factory=dict)
+    unit_suffix: str = ""
+    required_fields: tuple[str, ...] = ()
     file_ref_fields: tuple[str, ...] = ()
+    inventory: Inventory | None = None
+    path_rules: tuple[PathRule, ...] = ()
+    field_rules: dict[str, str] = field(default_factory=dict)
+    variant_values: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
 class Config:
     root: str
-    subsystem_sources_glob: str
-    subsystem_pattern: str
-    token_search_globs: tuple[str, ...]
-    query_token_patterns: tuple[str, ...]
+    unit_sources_glob: str
+    unit_pattern: str
+    source_globs: tuple[str, ...]
+    query_identifier_patterns: tuple[str, ...]
     custom_query_field: str
+    id_field: str
+    unit_field: str
     env: str
     profiles: dict[str, Profile]
 
@@ -68,44 +92,71 @@ def load_config(root: str, path: str | None = None) -> Config:
 
     profiles: dict[str, Profile] = {}
     for name, prof in profiles_raw.items():
-        spec_glob = prof.get("spec_glob")
-        if not spec_glob:
-            raise ConfigError(f"profile {name!r} has no spec_glob")
-        if prof.get("registry_glob") and not prof.get("registry_entry_pattern"):
-            raise ConfigError(
-                f"profile {name!r} sets registry_glob without registry_entry_pattern "
-                "(a regex whose group 1 is the app slug and optional group 2 the routing)"
-            )
-        kinds = {
-            kind_name: KindSpec(
-                name=kind_name,
-                required=tuple(kind.get("required") or ()),
-                tokens=tuple(kind.get("tokens") or ()),
-            )
-            for kind_name, kind in (prof.get("kinds") or {}).items()
-        }
-        profiles[name] = Profile(
-            name=name,
-            spec_glob=spec_glob,
-            kinds=kinds,
-            subsystem_suffix=prof.get("subsystem_suffix", ""),
-            registry_glob=prof.get("registry_glob", ""),
-            registry_entry_pattern=prof.get("registry_entry_pattern", ""),
-            registry_default_routing=prof.get("registry_default_routing", ""),
-            path_tenant_package_prefix=prof.get("path_tenant_package_prefix", ""),
-            requires_tenant=bool(prof.get("requires_tenant", False)),
-            requires_queue=bool(prof.get("requires_queue", False)),
-            queue_suffix=dict(prof.get("queue_suffix") or {}),
-            file_ref_fields=tuple(prof.get("file_ref_fields") or ()),
-        )
+        profiles[name] = _load_profile(name, prof)
 
     return Config(
         root=root,
-        subsystem_sources_glob=engine.get("subsystem_sources_glob", ""),
-        subsystem_pattern=engine.get("subsystem_pattern", ""),
-        token_search_globs=tuple(engine.get("token_search_globs") or ()),
-        query_token_patterns=tuple(engine.get("query_token_patterns") or ()),
+        unit_sources_glob=engine.get("unit_sources_glob", ""),
+        unit_pattern=engine.get("unit_pattern", ""),
+        source_globs=tuple(engine.get("source_globs") or ()),
+        query_identifier_patterns=tuple(engine.get("query_identifier_patterns") or ()),
         custom_query_field=engine.get("custom_query_field", "query"),
+        id_field=engine.get("id_field", "id"),
+        unit_field=engine.get("unit_field", "unit"),
         env=engine.get("env", "production"),
         profiles=profiles,
+    )
+
+
+def _load_profile(name: str, prof: dict) -> Profile:
+    spec_glob = prof.get("spec_glob")
+    if not spec_glob:
+        raise ConfigError(f"profile {name!r} has no spec_glob")
+
+    inventory = None
+    inv = prof.get("inventory")
+    if inv:
+        if not inv.get("glob") or not inv.get("entry_pattern"):
+            raise ConfigError(
+                f"profile {name!r} inventory needs both glob and entry_pattern "
+                "(a regex whose group 1 is the owner id and optional group 2 the variant)"
+            )
+        inventory = Inventory(
+            glob=inv["glob"],
+            entry_pattern=inv["entry_pattern"],
+            default_variant=inv.get("default_variant", ""),
+        )
+
+    path_rules = []
+    for rule in prof.get("path_rules") or []:
+        if not rule.get("field"):
+            raise ConfigError(f"profile {name!r} has a path_rule with no field")
+        path_rules.append(
+            PathRule(
+                spec_field=rule["field"],
+                ancestor=int(rule.get("ancestor", 0)),
+                prefix=rule.get("prefix", ""),
+            )
+        )
+
+    kinds = {
+        kind_name: KindSpec(
+            name=kind_name,
+            required=tuple(kind.get("required") or ()),
+            tokens=tuple(kind.get("tokens") or ()),
+        )
+        for kind_name, kind in (prof.get("kinds") or {}).items()
+    }
+
+    return Profile(
+        name=name,
+        spec_glob=spec_glob,
+        kinds=kinds,
+        unit_suffix=prof.get("unit_suffix", ""),
+        required_fields=tuple(prof.get("required_fields") or ()),
+        file_ref_fields=tuple(prof.get("file_ref_fields") or ()),
+        inventory=inventory,
+        path_rules=tuple(path_rules),
+        field_rules=dict(prof.get("field_rules") or {}),
+        variant_values=dict(prof.get("variant_values") or {}),
     )

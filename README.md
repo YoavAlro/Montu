@@ -40,7 +40,8 @@ changes while the spec itself sits untouched.
 | Code | Fails when |
 |---|---|
 | `E-YAML` | the spec is not parseable YAML |
-| `E-SCHEMA` | required fields missing, invalid alert kind for the profile, wrong `env` |
+| `E-SCHEMA` | required fields missing (including fields another field's value makes mandatory), invalid alert kind for the profile, wrong `env` |
+| `E-VALUE` | an alert field's value is outside the set its kind allows |
 | `E-PATH` | a spec field disagrees with the directory the spec sits in |
 | `E-INVENTORY` | the owner has no entry in its profile's inventory file |
 | `E-FIELD` | a derived field disagrees with the owner's id + inventory variant |
@@ -141,11 +142,21 @@ burst  = "batch"
 [profiles.<name>.kinds.error_rate]
 required = ["window_minutes", "threshold"]
 tokens = ["marker=request_failed"]   # identifiers this kind's query greps for
+
+# Declaring the built-in kind adds to its fields rather than replacing them.
+[profiles.<name>.kinds.custom]
+required = ["severity"]
+allowed_values = { severity = ["high", "low"] }   # checked when present (E-VALUE)
+# Fields a particular value obliges. The engine never learns what "high" means —
+# the repo states the rule, the engine only enforces it.
+requires_when = [{ field = "severity", equals = "high", require = ["escalation"] }]
 ```
 
 A spec's profile is whichever `spec_glob` discovered it — specs carry no profile field.
 The built-in `custom` kind requires `name`, the configured query field, and `condition`;
-its query text is scanned with `query_identifier_patterns`.
+its query text is scanned with `query_identifier_patterns`. Declaring
+`[profiles.<name>.kinds.custom]` adds to those three — it cannot drop them, so a repo can
+demand more of its custom alerts without losing what the engine always needs.
 
 ## Consuming
 

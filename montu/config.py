@@ -24,12 +24,29 @@ class ConfigError(Exception):
 
 
 @dataclass
+class ValueRule:
+    """Fields an alert must carry only when one of its fields holds a given value."""
+
+    spec_field: str
+    equals: str
+    require: tuple[str, ...] = ()
+
+
+@dataclass
 class KindSpec:
-    """One alert kind a profile allows, beyond the built-in `custom`."""
+    """One alert kind a profile allows, including the built-in `custom`.
+
+    `required` is unconditional. `allowed_values` constrains a field's value when the
+    field is present; `requires_when` makes other fields mandatory for a given value —
+    which is how a repo expresses "this severity must also declare X" without the
+    engine knowing what a severity is.
+    """
 
     name: str
     required: tuple[str, ...] = ()
     tokens: tuple[str, ...] = ()
+    allowed_values: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    requires_when: tuple[ValueRule, ...] = ()
 
 
 @dataclass
@@ -140,11 +157,7 @@ def _load_profile(name: str, prof: dict) -> Profile:
         )
 
     kinds = {
-        kind_name: KindSpec(
-            name=kind_name,
-            required=tuple(kind.get("required") or ()),
-            tokens=tuple(kind.get("tokens") or ()),
-        )
+        kind_name: _load_kind(f"{name}.{kind_name}", kind)
         for kind_name, kind in (prof.get("kinds") or {}).items()
     }
 
@@ -159,4 +172,34 @@ def _load_profile(name: str, prof: dict) -> Profile:
         path_rules=tuple(path_rules),
         field_rules=dict(prof.get("field_rules") or {}),
         variant_values=dict(prof.get("variant_values") or {}),
+    )
+
+
+def _load_kind(label: str, kind: dict) -> KindSpec:
+    rules = []
+    for rule in kind.get("requires_when") or []:
+        if not rule.get("field") or rule.get("equals") is None:
+            raise ConfigError(
+                f"kind {label!r} has a requires_when entry without both field and equals"
+            )
+        rules.append(
+            ValueRule(
+                spec_field=rule["field"],
+                equals=str(rule["equals"]),
+                require=tuple(rule.get("require") or ()),
+            )
+        )
+
+    allowed = {}
+    for spec_field, values in (kind.get("allowed_values") or {}).items():
+        if not values:
+            raise ConfigError(f"kind {label!r} declares allowed_values.{spec_field} as empty")
+        allowed[spec_field] = tuple(str(value) for value in values)
+
+    return KindSpec(
+        name=label.rpartition(".")[2],
+        required=tuple(kind.get("required") or ()),
+        tokens=tuple(kind.get("tokens") or ()),
+        allowed_values=allowed,
+        requires_when=tuple(rules),
     )

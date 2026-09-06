@@ -61,6 +61,11 @@ MONTU_TOML = textwrap.dedent(
     required = ["window_minutes", "threshold"]
     tokens = ["marker=cell_failed"]
 
+    [profiles.cell.kinds.custom]
+    required = ["tier"]
+    allowed_values = { tier = ["gold", "silver"] }
+    requires_when = [{ field = "tier", equals = "gold", require = ["owner"] }]
+
     [profiles.plain]
     spec_glob = "src/tools/*/monitoring.yaml"
     file_ref_fields = ["dashboard_model"]
@@ -92,6 +97,7 @@ CELL_SPEC = textwrap.dedent(
         name: latency
         query: "source logs | filter code == 'ALPHA_LATENCY'"
         condition: "count >= 1 in 15m"
+        tier: silver
         runbook: check latency
     dashboard: true
     """
@@ -249,6 +255,49 @@ def test_present_file_ref_passes(repo: Path):
     (tool / "monitoring.yaml").write_text(PLAIN_SPEC + "dashboard_model: widget.dashboard.json\n")
     findings, _ = lint(repo)
     assert "E-FILEREF" not in codes(findings)
+
+
+def test_declared_custom_kind_adds_required_fields(repo: Path):
+    spec = repo / "src" / "regions" / "region_north" / "cells" / "alpha_cell" / "monitoring.yaml"
+    spec.write_text(CELL_SPEC.replace("    tier: silver\n", ""))
+    findings, _ = lint(repo)
+    assert any("requires tier" in f.message for f in findings if f.code == "E-SCHEMA")
+
+
+def test_declared_custom_kind_keeps_the_builtin_fields(repo: Path):
+    """Declaring `custom` to add a field must not drop the fields the engine always needs."""
+    spec = repo / "src" / "regions" / "region_north" / "cells" / "alpha_cell" / "monitoring.yaml"
+    spec.write_text(CELL_SPEC.replace('    condition: "count >= 1 in 15m"\n', ""))
+    findings, _ = lint(repo)
+    assert any("requires condition" in f.message for f in findings if f.code == "E-SCHEMA")
+
+
+def test_value_outside_allowed_values_fails(repo: Path):
+    spec = repo / "src" / "regions" / "region_north" / "cells" / "alpha_cell" / "monitoring.yaml"
+    spec.write_text(CELL_SPEC.replace("tier: silver", "tier: bronze"))
+    findings, _ = lint(repo)
+    assert any("bronze" in f.message for f in findings if f.code == "E-VALUE")
+
+
+def test_conditional_requirement_fires_only_for_the_gating_value(repo: Path):
+    spec = repo / "src" / "regions" / "region_north" / "cells" / "alpha_cell" / "monitoring.yaml"
+    spec.write_text(CELL_SPEC.replace("tier: silver", "tier: gold"))
+    findings, _ = lint(repo)
+    assert any(
+        "requires owner when tier is 'gold'" in f.message
+        for f in findings
+        if f.code == "E-SCHEMA"
+    )
+    spec.write_text(CELL_SPEC)  # the non-gating value obliges nothing
+    findings, _ = lint(repo)
+    assert [f for f in findings if f.is_error] == []
+
+
+def test_gated_field_present_satisfies_the_rule(repo: Path):
+    spec = repo / "src" / "regions" / "region_north" / "cells" / "alpha_cell" / "monitoring.yaml"
+    spec.write_text(CELL_SPEC.replace("tier: silver", "tier: gold\n    owner: pager-a"))
+    findings, _ = lint(repo)
+    assert [f for f in findings if f.is_error] == []
 
 
 def test_estate_map_prints_gaps_and_coverage(repo: Path, capsys):

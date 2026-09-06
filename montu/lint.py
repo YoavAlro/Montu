@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 import yaml
 
-from montu.config import Config, Profile
+from montu.config import Config, KindSpec, Profile
 from montu.repo import discover, extract_units, identifier_exists, read_inventory
 
 
@@ -91,15 +91,23 @@ class Linter:
             err("alerts must be a non-empty list")
             return findings
         valid_kinds = set(profile.kinds) | {"custom"}
-        custom_required = ("name", self.config.custom_query_field, "condition")
+        builtin_custom = ("name", self.config.custom_query_field, "condition")
         for i, alert in enumerate(alerts):
             kind = (alert or {}).get("kind")
             if kind not in valid_kinds:
                 err(f"alerts[{i}].kind {kind!r} not in {sorted(valid_kinds)} for profile {profile.name!r}")
                 continue
-            for field_name in custom_required if kind == "custom" else profile.kinds[kind].required:
+            declared = profile.kinds.get(kind)
+            required = declared.required if declared else ()
+            if kind == "custom":
+                # The built-in fields are a floor a declared `custom` kind adds to, never
+                # replaces — otherwise declaring one to add a field would silently drop them.
+                required = tuple(dict.fromkeys(builtin_custom + required))
+            for field_name in required:
                 if field_name not in alert or alert.get(field_name) is None:
                     err(f"alerts[{i}] ({kind}) requires {field_name}")
+            if declared is not None:
+                findings.extend(self._check_values(alert, i, kind, declared, rel))
             if not (alert.get("runbook") or "").strip():
                 findings.append(
                     Finding(
@@ -110,6 +118,43 @@ class Linter:
                         is_error=False,
                     )
                 )
+        return findings
+
+    def _check_values(
+        self, alert: dict, index: int, kind: str, declared: KindSpec, rel: str
+    ) -> list[Finding]:
+        """A field's permitted values, and the fields a given value makes mandatory.
+
+        Lets a repo say "this value of that field obliges these other fields" without the
+        engine learning what any of them mean.
+        """
+        findings: list[Finding] = []
+        for spec_field, allowed in declared.allowed_values.items():
+            value = alert.get(spec_field)
+            if value is None:
+                continue  # presence is `required`'s job, not this check's
+            if str(value) not in allowed:
+                findings.append(
+                    Finding(
+                        rel,
+                        "E-VALUE",
+                        f"alerts[{index}] ({kind}) {spec_field} {value!r} is not one of "
+                        f"{list(allowed)}",
+                    )
+                )
+        for rule in declared.requires_when:
+            if str(alert.get(rule.spec_field)) != rule.equals:
+                continue
+            for spec_field in rule.require:
+                if alert.get(spec_field) is None:
+                    findings.append(
+                        Finding(
+                            rel,
+                            "E-SCHEMA",
+                            f"alerts[{index}] ({kind}) requires {spec_field} when "
+                            f"{rule.spec_field} is {rule.equals!r}",
+                        )
+                    )
         return findings
 
     def _check_paths(self, app: dict, abs_path: str, rel: str, profile: Profile) -> list[Finding]:

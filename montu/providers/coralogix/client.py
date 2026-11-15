@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import time
 import urllib.error
@@ -44,7 +45,8 @@ def _urllib_transport(
         with urllib.request.urlopen(req, timeout=30) as resp:
             return resp.status, resp.read()
     except urllib.error.HTTPError as exc:
-        return exc.code, exc.read()
+        with exc:
+            return exc.code, exc.read()
 
 
 class CoralogixAlertsClient:
@@ -120,7 +122,7 @@ class CoralogixAlertsClient:
         for attempt in range(max_attempts):
             try:
                 status, raw = self._transport(method, url, self._headers, encoded)
-            except urllib.error.URLError:
+            except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException):
                 if attempt < max_attempts - 1:
                     self._sleep(2**attempt)
                     continue

@@ -441,3 +441,62 @@ def test_reconciler_plan_apply_orphan_cap_and_partial_error(tmp_path: Path):
     with pytest.raises(PartialApplyError) as exc_info:
         apply_plan(plan2, failing_backend, max_auto_disable=3)
     assert "Partial Apply (Failed)" in format_partial_apply_markdown(exc_info.value, 3)
+
+
+def test_render_enforces_strict_keys_per_glob_zero_match_and_client_retries_timeout(tmp_path: Path):
+    from montu.providers.coralogix.renderer import SpecRenderError
+
+    repo_dir = _setup_provider_repo(
+        tmp_path,
+        """
+        version: 1
+        app:
+          slug: billing
+          subsystem: billing-api
+        env: production
+        slack_channel: "#ops-alerts"
+        alerts:
+          - kind: error_rate
+            priority: P3
+            renotify_minute: 15
+            window_minutes: 60
+            deviation_pct: 100
+            min_threshold: 10
+            runbook: Errors up.
+        """,
+    )
+    # render_estate directly rejects unknown optional keys (`renotify_minute`) under strict_keys
+    with pytest.raises(SpecRenderError, match="renotify_minute"):
+        render_estate(load_config(str(repo_dir)))
+
+    # A second glob in spec_glob matching 0 files fails both lint and render_estate
+    spec_file = repo_dir / "services" / "billing" / "monitoring.yaml"
+    spec_file.write_text(spec_file.read_text().replace("  renotify_minute: 15\n", ""))
+    toml_file = repo_dir / "montu.toml"
+    toml_file.write_text(
+        toml_file.read_text().replace(
+            'spec_glob = "services/*/monitoring.yaml"',
+            'spec_glob = ["services/*/monitoring.yaml", "missing_dir/*/monitoring.yaml"]',
+        )
+    )
+    with pytest.raises(SpecRenderError, match="missing_dir"):
+        render_estate(load_config(str(repo_dir)))
+    findings, _ = Linter(load_config(str(repo_dir))).lint()
+    assert any("missing_dir" in f.message for f in findings if f.code == "E-SCHEMA")
+
+    # Client retries idempotent GET on post-connect TimeoutError
+    attempts = 0
+
+    def timeout_once(_method: str, _url: str, _headers: dict[str, str], _body: bytes | None) -> tuple[int, bytes]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise TimeoutError("read timed out")
+        return 200, b'{"alertDefs": [], "pagination": {"nextPageToken": ""}}'
+
+    client = CoralogixAlertsClient(
+        api_key="k", domain="cx498.coralogix.com", transport=timeout_once, sleep_fn=lambda _: None
+    )
+    assert client.list_alerts() == []
+    assert attempts == 2
+

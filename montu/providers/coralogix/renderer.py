@@ -16,6 +16,7 @@ from typing import Any
 import yaml
 
 from montu.config import Config, Profile
+from montu.lint import Linter
 from montu.providers.coralogix.dataprime import (
     CompileError,
     SimpleLogFilter,
@@ -23,7 +24,7 @@ from montu.providers.coralogix.dataprime import (
     compile_filter_query,
     compile_ratio_query,
 )
-from montu.repo import discover_all
+from montu.repo import discover, discover_all
 
 
 class SpecRenderError(ValueError):
@@ -210,12 +211,17 @@ def render_estate(config: Config, only_paths: list[str] | None = None) -> Render
     seen_names: dict[str, str] = {}
     matched: set[str] = set()
 
+    linter = Linter(config)
+    schema_seen: dict[str, str] = {}
+
     for profile in config.profiles.values():
+        if requested is None:
+            for glob_pat in profile.spec_globs:
+                if not discover(config.root, glob_pat):
+                    raise SpecRenderError(
+                        f"profile {profile.name!r} spec_glob {glob_pat!r} matched 0 files"
+                    )
         hits = discover_all(config.root, profile.spec_globs)
-        if requested is None and not hits:
-            raise SpecRenderError(
-                f"profile {profile.name!r} spec_glob {list(profile.spec_globs)} matched 0 files"
-            )
         for rel in hits:
             if requested is not None and rel not in requested:
                 continue
@@ -228,6 +234,18 @@ def render_estate(config: Config, only_paths: list[str] | None = None) -> Render
                 raise SpecRenderError(f"invalid YAML: {exc}", spec_path=rel) from exc
             if not isinstance(spec, dict):
                 raise SpecRenderError("top-level YAML must be a mapping", spec_path=rel)
+            raw_app = spec.get("app")
+            app_dict = raw_app if isinstance(raw_app, dict) else {}
+            schema_errors = [
+                f
+                for f in linter.check_spec_schema(
+                    spec, raw_app, app_dict, rel, profile, schema_seen
+                )
+                if f.is_error
+            ]
+            if schema_errors:
+                first = schema_errors[0]
+                raise SpecRenderError(f"{first.code}: {first.message}", spec_path=rel)
             spec_res = render_spec(
                 spec, config=config, profile=profile, settings=settings, spec_path=rel
             )
@@ -583,9 +601,11 @@ def _parse_active_hours(raw: Any, ctx: str, spec_path: str) -> dict[str, Any] | 
 
 
 def _clean_description(entry: dict[str, Any]) -> str:
-    runbook = (entry.get("runbook") or "").strip()
+    raw_rb = entry.get("runbook")
+    runbook = raw_rb.strip() if isinstance(raw_rb, str) else ""
     if not runbook:
-        return str(entry.get("description") or "").strip()
+        raw_desc = entry.get("description")
+        return raw_desc.strip() if isinstance(raw_desc, str) else ""
     paragraphs = [
         " ".join(line.strip() for line in para.splitlines() if line.strip())
         for para in _PARAGRAPH_SPLIT_RE.split(runbook)

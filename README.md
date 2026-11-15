@@ -30,6 +30,9 @@ in `montu.toml`.
 montu lint            # validate ALL specs against the code (exit 1 on drift)
 montu lint <paths...> # validate specific specs
 montu map             # print the monitoring estate (coverage, gaps, runbooks)
+montu render          # print rendered provider alert definitions JSON (requires [providers.*])
+montu plan            # dry-run rendered specs against the live provider (--fail-on-drift exits 3)
+montu apply           # reconcile live provider alerts (--allow-mass-disable overrides cap)
 ```
 
 `lint` always validates every spec, never fix-on-touch: drift is usually caused by code
@@ -40,8 +43,10 @@ changes while the spec itself sits untouched.
 | Code | Fails when |
 |---|---|
 | `E-YAML` | the spec is not parseable YAML |
-| `E-SCHEMA` | required fields missing (including fields another field's value makes mandatory), invalid alert kind for the profile, wrong `env` |
-| `E-VALUE` | an alert field's value is outside the set its kind allows |
+| `E-SCHEMA` | required fields missing (including fields another field's value makes mandatory), unknown keys when `strict_keys = true`, invalid alert kind for the profile, wrong `env` |
+| `E-VALUE` | an alert field's value or type/bound is outside what its kind allows |
+| `E-DUPLICATE` | two alerts render to the same `name_template` across or within specs |
+| `E-COMPILE` | an alert fails offline compilation for a configured `[providers.*]` backend |
 | `E-PATH` | a spec field disagrees with the directory the spec sits in |
 | `E-INVENTORY` | the owner has no entry in its profile's inventory file |
 | `E-FIELD` | a derived field disagrees with the owner's id + inventory variant |
@@ -104,9 +109,12 @@ custom_query_field = "query"   # what the raw-query field is called in your spec
 id_field = "id"                # which app.* field is the owner id
 unit_field = "unit"            # which app.* field names the deployable unit
 env = "production"             # the only env specs may declare
+strict_keys = true             # optional closed-world check rejecting unknown YAML keys
+spec_fields = ["dashboard"]    # optional top-level fields allowed when strict_keys = true
 
 [profiles.<name>]
-spec_glob = "services/*/monitoring.yaml"
+spec_glob = ["services/*/monitoring.yaml", "workers/*/*/monitoring.yaml"] # string or list
+name_template = "[SVC][{id}] {alert}"  # optional; enables cross-spec E-DUPLICATE checks
 unit_suffix = ""                       # appended to extracted unit names when matching
 required_fields = ["team"]             # extra app.* fields this profile demands
 file_ref_fields = ["dashboard_model"]  # spec fields naming a sibling file (E-FILEREF)

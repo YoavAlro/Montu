@@ -7,14 +7,23 @@ identifier) while the spec itself sits untouched.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from dataclasses import dataclass
 
 import yaml
 
-from montu.config import Config, KindSpec, Profile
-from montu.repo import discover, extract_units, identifier_exists, read_inventory
+from montu.config import Config, FieldTypeRule, KindSpec, Profile, ValueRule
+from montu.repo import (
+    discover,
+    discover_all,
+    extract_units,
+    identifier_exists,
+    read_inventory,
+)
+
+_HHMM_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 
 
 @dataclass
@@ -38,30 +47,66 @@ class Linter:
         """Lint every discovered spec (or `only_paths`); returns (findings, spec count)."""
         findings: list[Finding] = []
         total = 0
+        matched_paths: set[str] = set()
+        seen_names: dict[str, str] = {}
+
         for profile in self.config.profiles.values():
-            spec_rels = discover(self.config.root, profile.spec_glob)
-            if only_paths is not None:
-                spec_rels = [rel for rel in spec_rels if rel in only_paths]
+            all_rels = discover_all(self.config.root, profile.spec_globs)
+            if only_paths is None and self.config.strict_keys and not all_rels:
+                findings.append(
+                    Finding(
+                        "montu.toml",
+                        "E-SCHEMA",
+                        f"profile {profile.name!r} spec_glob {list(profile.spec_globs)} matched 0 files",
+                    )
+                )
+            spec_rels = (
+                [rel for rel in all_rels if rel in only_paths]
+                if only_paths is not None
+                else all_rels
+            )
+            matched_paths.update(spec_rels)
             total += len(spec_rels)
             for rel in spec_rels:
-                findings.extend(self._lint_spec(rel, profile))
-            findings.extend(self._uncovered(profile, spec_rels))
+                findings.extend(self._lint_spec(rel, profile, seen_names))
+            if only_paths is None:
+                findings.extend(self._uncovered(profile, spec_rels))
+
+        if only_paths is not None:
+            for requested in only_paths:
+                if requested not in matched_paths:
+                    findings.append(
+                        Finding(
+                            requested,
+                            "E-SCHEMA",
+                            "path matches no profile spec_glob in montu.toml",
+                        )
+                    )
+
+        if self.config.providers and not any(f.is_error for f in findings):
+            from montu.providers import lint_providers
+
+            findings.extend(lint_providers(self.config, only_paths))
+
         return findings, total
 
     # --- per-spec checks -------------------------------------------------------
 
-    def _lint_spec(self, rel: str, profile: Profile) -> list[Finding]:
+    def _lint_spec(
+        self, rel: str, profile: Profile, seen_names: dict[str, str]
+    ) -> list[Finding]:
         abs_path = os.path.join(self.config.root, rel)
         try:
             with open(abs_path, encoding="utf-8") as handle:
                 spec = yaml.safe_load(handle)
-        except yaml.YAMLError as exc:
+        except (OSError, yaml.YAMLError) as exc:
             return [Finding(rel, "E-YAML", f"unparseable: {exc}")]
         if not isinstance(spec, dict):
             return [Finding(rel, "E-YAML", "top level must be a mapping")]
 
-        app = spec.get("app") or {}
-        findings = self._check_schema(spec, app, rel, profile)
+        raw_app = spec.get("app")
+        app = raw_app if isinstance(raw_app, dict) else {}
+        findings = self._check_schema(spec, raw_app, app, rel, profile, seen_names)
         findings.extend(self._check_paths(app, abs_path, rel, profile))
         findings.extend(self._check_inventory_and_fields(app, abs_path, rel, profile))
         findings.extend(self._check_unit(app, rel, profile))
@@ -69,18 +114,62 @@ class Linter:
         findings.extend(self._check_file_refs(spec, abs_path, rel, profile))
         return findings
 
-    def _check_schema(self, spec: dict, app: dict, rel: str, profile: Profile) -> list[Finding]:
+    def _check_schema(
+        self,
+        spec: dict,
+        raw_app: object,
+        app: dict,
+        rel: str,
+        profile: Profile,
+        seen_names: dict[str, str],
+    ) -> list[Finding]:
         findings: list[Finding] = []
 
         def err(msg: str) -> None:
             findings.append(Finding(rel, "E-SCHEMA", msg))
 
+        if self.config.strict_keys:
+            allowed_root = {
+                "version",
+                "app",
+                "env",
+                "slack_channel",
+                "alerts",
+                *self.config.spec_fields,
+                *profile.file_ref_fields,
+            }
+            extra_root = sorted(set(spec) - allowed_root)
+            if extra_root:
+                err(f"unknown top-level key(s): {extra_root}")
+
+        for spec_field, rule in self.config.spec_field_types.items():
+            val, type_err = _resolve_field(spec, spec_field)
+            if type_err is not None:
+                err(type_err)
+            elif val is not None:
+                msg = _validate_type_rule(spec, spec_field, val, rule)
+                if msg is not None:
+                    findings.append(Finding(rel, "E-VALUE", msg))
+
         if spec.get("version") != 1:
             err("version must be 1")
-        required = {self.config.id_field, self.config.unit_field, *profile.required_fields}
-        for field_name in sorted(required):
-            if not isinstance(app.get(field_name), str) or not app.get(field_name):
-                err(f"app.{field_name} is required and must be a non-empty string")
+
+        if not isinstance(raw_app, dict):
+            err("app must be a mapping")
+        else:
+            required_app = {
+                self.config.id_field,
+                self.config.unit_field,
+                *profile.required_fields,
+            }
+            if self.config.strict_keys:
+                extra_app = sorted(set(app) - required_app)
+                if extra_app:
+                    err(f"unknown key(s) in app: {extra_app}")
+            for field_name in sorted(required_app):
+                if not isinstance(app.get(field_name), str) or not app.get(field_name):
+                    err(f"app.{field_name} is required and must be a non-empty string")
+
         if spec.get("env") != self.config.env:
             err(f"env must be {self.config.env!r} — the contract supports no other environment")
         if "slack_channel" not in spec:
@@ -98,13 +187,14 @@ class Linter:
                 continue
             kind = alert.get("kind")
             if kind not in valid_kinds:
-                err(f"alerts[{i}].kind {kind!r} not in {sorted(valid_kinds)} for profile {profile.name!r}")
+                err(
+                    f"alerts[{i}].kind {kind!r} not in {sorted(valid_kinds)} "
+                    f"for profile {profile.name!r}"
+                )
                 continue
             declared = profile.kinds.get(kind)
             required = declared.required if declared else ()
             if kind == "custom":
-                # The built-in fields are a floor a declared `custom` kind adds to, never
-                # replaces — otherwise declaring one to add a field would silently drop them.
                 required = tuple(dict.fromkeys(builtin_custom + required))
             reported_prefixes: set[str] = set()
             for field_name in required:
@@ -119,10 +209,22 @@ class Linter:
                 elif value is None:
                     err(f"alerts[{i}] ({kind}) requires {field_name}")
                     reported_prefixes.add(field_name)
-            if declared is not None:
+
+            if self.config.strict_keys:
                 findings.extend(
-                    self._check_values(alert, i, kind, declared, rel, reported_prefixes)
+                    self._check_unknown_alert_keys(
+                        alert, i, kind, declared, profile, rel, reported_prefixes
+                    )
                 )
+
+            findings.extend(
+                self._check_values_and_types(
+                    alert, i, kind, declared, profile, rel, reported_prefixes
+                )
+            )
+            self._check_unique_alert_name(
+                spec, app, alert, i, kind, profile, rel, seen_names, findings
+            )
             if not (alert.get("runbook") or "").strip():
                 findings.append(
                     Finding(
@@ -135,29 +237,126 @@ class Linter:
                 )
         return findings
 
-    def _check_values(
+    def _declared_alert_paths(
+        self, kind: str, declared: KindSpec | None, profile: Profile
+    ) -> set[str]:
+        paths: set[str] = {"kind", "runbook", *profile.common_alert_fields}
+        paths.update(profile.field_types)
+        paths.update(profile.common_allowed_values)
+        for rule in profile.common_requires_when:
+            paths.add(rule.spec_field)
+            paths.update(rule.require)
+        if kind == "custom":
+            paths.update(("name", self.config.custom_query_field, "condition"))
+        if declared is not None:
+            paths.update(declared.required)
+            paths.update(declared.optional)
+            paths.update(declared.allowed_values)
+            paths.update(declared.field_types)
+            for rule in declared.requires_when:
+                paths.add(rule.spec_field)
+                paths.update(rule.require)
+        return paths
+
+    def _check_unknown_alert_keys(
         self,
         alert: dict,
         index: int,
         kind: str,
-        declared: KindSpec,
+        declared: KindSpec | None,
+        profile: Profile,
         rel: str,
         reported_prefixes: set[str],
     ) -> list[Finding]:
-        """A field's permitted values, and the fields another field obliges.
+        declared_paths = self._declared_alert_paths(kind, declared, profile)
+        children_by_prefix: dict[str, set[str]] = {}
+        for field_path in declared_paths:
+            parts = field_path.split(".")
+            for depth in range(len(parts)):
+                prefix = ".".join(parts[:depth])
+                children_by_prefix.setdefault(prefix, set()).add(parts[depth])
 
-        Lets a repo say "this value (or presence) of that field obliges these other
-        fields" — including dotted paths into structured blocks — without the engine
-        learning what any of them mean.
-        """
         findings: list[Finding] = []
+
+        def walk(mapping: dict, prefix: str) -> None:
+            allowed_here = children_by_prefix.get(prefix, set())
+            extra = sorted(set(mapping) - allowed_here)
+            if extra:
+                where = f" in {prefix}" if prefix else ""
+                findings.append(
+                    Finding(
+                        rel,
+                        "E-SCHEMA",
+                        f"alerts[{index}] ({kind}) unknown key(s){where}: {extra}",
+                    )
+                )
+            for key in sorted(set(mapping) & allowed_here):
+                val = mapping[key]
+                if val is None:
+                    continue
+                sub = f"{prefix}.{key}" if prefix else key
+                if sub in children_by_prefix:
+                    if not isinstance(val, dict):
+                        if sub not in reported_prefixes:
+                            findings.append(
+                                Finding(
+                                    rel,
+                                    "E-SCHEMA",
+                                    f"alerts[{index}] ({kind}) {sub} must be a mapping, "
+                                    f"got {type(val).__name__}",
+                                )
+                            )
+                            reported_prefixes.add(sub)
+                    else:
+                        walk(val, sub)
+                elif (
+                    isinstance(val, dict)
+                    and not (kind == "custom" and sub == "condition")
+                    and sub not in reported_prefixes
+                ):
+                    findings.append(
+                        Finding(
+                            rel,
+                            "E-SCHEMA",
+                            f"alerts[{index}] ({kind}) {sub} must not be a mapping",
+                        )
+                    )
+                    reported_prefixes.add(sub)
+
+        walk(alert, "")
+        return findings
+
+    def _check_values_and_types(
+        self,
+        alert: dict,
+        index: int,
+        kind: str,
+        declared: KindSpec | None,
+        profile: Profile,
+        rel: str,
+        reported_prefixes: set[str],
+    ) -> list[Finding]:
+        """Permitted values, scalar/list type rules, and presence/value-gated fields."""
+        findings: list[Finding] = []
+        allowed_values = {
+            **profile.common_allowed_values,
+            **(declared.allowed_values if declared else {}),
+        }
+        field_types = {
+            **profile.field_types,
+            **(declared.field_types if declared else {}),
+        }
+        value_rules: tuple[ValueRule, ...] = (
+            *profile.common_requires_when,
+            *(declared.requires_when if declared else ()),
+        )
 
         def schema_err(prefix: str, msg: str) -> None:
             if prefix not in reported_prefixes:
                 findings.append(Finding(rel, "E-SCHEMA", f"alerts[{index}] ({kind}) {msg}"))
                 reported_prefixes.add(prefix)
 
-        for spec_field, allowed in declared.allowed_values.items():
+        for spec_field, type_rule in field_types.items():
             if _ancestor_reported(spec_field, reported_prefixes):
                 continue
             value, type_err = _resolve_field(alert, spec_field)
@@ -165,17 +364,35 @@ class Linter:
                 schema_err(type_err.split(" ", 1)[0], type_err)
                 continue
             if value is None:
-                continue  # presence is `required`'s job, not this check's
-            if str(value) not in allowed:
+                continue
+            msg = _validate_type_rule(alert, spec_field, value, type_rule)
+            if msg is not None:
                 findings.append(
-                    Finding(
-                        rel,
-                        "E-VALUE",
-                        f"alerts[{index}] ({kind}) {spec_field} {value!r} is not one of "
-                        f"{list(allowed)}",
-                    )
+                    Finding(rel, "E-VALUE", f"alerts[{index}] ({kind}) {msg}")
                 )
-        for rule in declared.requires_when:
+
+        for spec_field, allowed in allowed_values.items():
+            if _ancestor_reported(spec_field, reported_prefixes):
+                continue
+            value, type_err = _resolve_field(alert, spec_field)
+            if type_err is not None:
+                schema_err(type_err.split(" ", 1)[0], type_err)
+                continue
+            if value is None:
+                continue
+            items = value if isinstance(value, list) else [value]
+            for item in items:
+                if str(item) not in allowed:
+                    findings.append(
+                        Finding(
+                            rel,
+                            "E-VALUE",
+                            f"alerts[{index}] ({kind}) {spec_field} {item!r} is not one of "
+                            f"{list(allowed)}",
+                        )
+                    )
+
+        for rule in value_rules:
             if _ancestor_reported(rule.spec_field, reported_prefixes):
                 continue
             gate_val, type_err = _resolve_field(alert, rule.spec_field)
@@ -209,6 +426,43 @@ class Linter:
                     )
                     reported_prefixes.add(spec_field)
         return findings
+
+    def _check_unique_alert_name(
+        self,
+        spec: dict,
+        app: dict,
+        alert: dict,
+        index: int,
+        kind: str,
+        profile: Profile,
+        rel: str,
+        seen_names: dict[str, str],
+        findings: list[Finding],
+    ) -> None:
+        if not profile.name_template:
+            return
+        raw_suffix = alert.get("name") if kind == "custom" else kind
+        if not isinstance(raw_suffix, str) or not raw_suffix.strip():
+            return
+        env_val = str(spec.get("env") or "")
+        try:
+            rendered = profile.name_template.format(**app, alert=raw_suffix.strip(), env=env_val)
+        except KeyError:
+            return
+        if "{env}" not in profile.name_template and env_val and env_val != self.config.env:
+            rendered = f"{rendered} · {env_val}"
+        prev = seen_names.get(rendered)
+        if prev is not None:
+            findings.append(
+                Finding(
+                    rel,
+                    "E-DUPLICATE",
+                    f"alerts[{index}] ({kind}) duplicate alert name {rendered!r} "
+                    f"(already declared in {prev})",
+                )
+            )
+        else:
+            seen_names[rendered] = rel
 
     def _check_paths(self, app: dict, abs_path: str, rel: str, profile: Profile) -> list[Finding]:
         """Spec fields that must agree with where the spec sits in the tree."""
@@ -297,9 +551,13 @@ class Linter:
         """Every identifier an alert's query references must exist in tracked sources."""
         findings: list[Finding] = []
         for alert in spec.get("alerts") or []:
-            kind = (alert or {}).get("kind")
+            if not isinstance(alert, dict):
+                continue
+            kind = alert.get("kind")
             if kind == "custom":
                 query = alert.get(self.config.custom_query_field) or ""
+                if not isinstance(query, str):
+                    continue
                 identifiers: tuple[str, ...] = ()
                 for pattern in self.config.query_identifier_patterns:
                     identifiers += tuple(re.findall(pattern, query))
@@ -378,6 +636,67 @@ class Linter:
             if parent == directory:
                 return next(iter(sorted(candidates)), "")
             directory = parent
+
+
+def _validate_type_rule(
+    container: dict, field_path: str, value: object, rule: FieldTypeRule
+) -> str | None:
+    if rule.kind == "bool":
+        if not isinstance(value, bool):
+            return f"{field_path} must be a boolean, got {value!r}"
+        return None
+    if rule.kind == "str":
+        if not isinstance(value, str) or not value.strip():
+            return f"{field_path} must be a non-empty string, got {value!r}"
+        return None
+    if rule.kind == "str_or_empty":
+        if not isinstance(value, str):
+            return f"{field_path} must be a string, got {value!r}"
+        return None
+    if rule.kind == "str_list":
+        if (
+            not isinstance(value, list)
+            or not value
+            or not all(isinstance(item, str) and item.strip() for item in value)
+        ):
+            return f"{field_path} must be a non-empty list of non-empty strings, got {value!r}"
+        return None
+    if rule.kind == "hhmm":
+        if not isinstance(value, str) or not _HHMM_RE.match(value):
+            return f"{field_path} must be HH:MM (00:00..23:59), got {value!r}"
+        return None
+
+    if rule.kind in ("pos_int", "nonneg_int", "int"):
+        if not isinstance(value, int) or isinstance(value, bool):
+            return f"{field_path} must be an integer, got {value!r}"
+        if rule.kind == "pos_int" and value < 1:
+            return f"{field_path} must be a positive integer (>= 1), got {value!r}"
+        if rule.kind == "nonneg_int" and value < 0:
+            return f"{field_path} must be a non-negative integer (>= 0), got {value!r}"
+        num_val: int | float = value
+    else:
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+            return f"{field_path} must be a finite number, got {value!r}"
+        num_val = value
+
+    if rule.gt is not None and not (num_val > rule.gt):
+        return f"{field_path} ({num_val}) must be > {rule.gt}"
+    if rule.gte is not None and not (num_val >= rule.gte):
+        return f"{field_path} ({num_val}) must be >= {rule.gte}"
+    if rule.lt is not None and not (num_val < rule.lt):
+        return f"{field_path} ({num_val}) must be < {rule.lt}"
+    if rule.lte is not None and not (num_val <= rule.lte):
+        return f"{field_path} ({num_val}) must be <= {rule.lte}"
+    if rule.lte_field is not None:
+        other_val, _ = _resolve_field(container, rule.lte_field)
+        if (
+            isinstance(other_val, (int, float))
+            and not isinstance(other_val, bool)
+            and math.isfinite(other_val)
+            and num_val > other_val
+        ):
+            return f"{field_path} ({num_val}) must not exceed {rule.lte_field} ({other_val})"
+    return None
 
 
 def _resolve_field(mapping: dict, field_path: str) -> tuple[object, str | None]:

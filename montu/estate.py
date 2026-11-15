@@ -7,13 +7,13 @@ import os
 import yaml
 
 from montu.config import Config, Profile
-from montu.repo import discover, read_inventory
+from montu.repo import discover, discover_all, read_inventory
 
 
 def print_estate(config: Config) -> int:
     for profile in config.profiles.values():
         print(f"profile: {profile.name}")
-        spec_rels = discover(config.root, profile.spec_glob)
+        spec_rels = discover_all(config.root, profile.spec_globs)
         specs_by_owner = {os.path.basename(os.path.dirname(rel)): rel for rel in spec_rels}
         for owner in _owners(config, profile, specs_by_owner):
             rel = specs_by_owner.get(owner)

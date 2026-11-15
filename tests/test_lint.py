@@ -388,3 +388,112 @@ def test_dotted_field_rules_validate_nested_mappings(repo: Path):
     )
     findings, _ = lint(repo)
     assert [f for f in findings if f.is_error] == []
+
+
+def test_multi_glob_spec_glob_collapses_split_depths(repo: Path):
+    job = repo / "src" / "jobs" / "nightly" / "cleanup"
+    job.mkdir(parents=True)
+    (repo / "deploy" / "c.yaml").write_text("service: cleanup-job\n")
+    (job / "monitoring.yaml").write_text(
+        PLAIN_SPEC.replace("slug: widget", "slug: cleanup").replace("unit: widget-tool", "unit: cleanup-job")
+    )
+    (repo / "montu.toml").write_text(
+        MONTU_TOML.replace(
+            'spec_glob = "src/tools/*/monitoring.yaml"',
+            'spec_glob = ["src/tools/*/monitoring.yaml", "src/jobs/*/*/monitoring.yaml"]',
+        )
+    )
+    findings, total = lint(repo)
+    assert total == 3
+    assert [f for f in findings if f.is_error] == []
+
+
+def test_strict_keys_field_types_and_duplicate_names(repo: Path):
+    strict_toml = MONTU_TOML.replace(
+        'env = "production"',
+        textwrap.dedent(
+            """
+            env = "production"
+            strict_keys = true
+            spec_fields = ["dashboard", "incident_minutes"]
+            spec_field_types = { dashboard = "bool", incident_minutes = "pos_int" }
+            """
+        ).strip(),
+    ).replace(
+        'file_ref_fields = ["dashboard_model"]',
+        textwrap.dedent(
+            """
+            file_ref_fields = ["dashboard_model"]
+            name_template = "[PLAIN][{slug}] {alert}"
+            common_alert_fields = ["active_hours.days", "active_hours.start", "active_hours.end"]
+            common_allowed_values = { "active_hours.days" = ["monday", "tuesday"] }
+            common_requires_when = [
+                { field = "active_hours", present = true, require = ["active_hours.days", "active_hours.start", "active_hours.end"] },
+            ]
+            field_types = { "active_hours.days" = "str_list", "active_hours.start" = "hhmm", "active_hours.end" = "hhmm" }
+            """
+        ).strip(),
+    ).replace(
+        '[profiles.plain.kinds.error_rate]\nrequired = ["window_minutes", "threshold"]',
+        textwrap.dedent(
+            """
+            [profiles.plain.kinds.error_rate]
+            required = ["window_minutes", "threshold"]
+            optional = ["eval_every_minutes", "queues"]
+            [profiles.plain.kinds.error_rate.field_types]
+            window_minutes = { type = "pos_int", lte = 1440 }
+            eval_every_minutes = { type = "pos_int", lte_field = "window_minutes" }
+            threshold = { type = "number", gt = 0, lte = 100 }
+            queues = "str_list"
+            """
+        ).strip(),
+    )
+    (repo / "montu.toml").write_text(strict_toml)
+
+    spec = repo / "src" / "tools" / "widget" / "monitoring.yaml"
+    spec.write_text(
+        textwrap.dedent(
+            """
+            version: 1
+            unknown_root: 1
+            incident_minutes: 0
+            app:
+              slug: widget
+              unit: widget-tool
+              extra_app: nope
+            env: production
+            slack_channel: "#widget"
+            alerts:
+              - kind: error_rate
+                window_minutes: 15
+                eval_every_minutes: 30
+                threshold: 150
+                queues: "not-a-list"
+                typo_field: 1
+                active_hours:
+                  days: ["funday"]
+                  start: "25:00"
+                  end: "09:00"
+                  tz: "UTC"
+                runbook: check widget
+              - kind: error_rate
+                window_minutes: 15
+                threshold: 10
+                runbook: duplicate kind in same spec
+            dashboard: true
+            """
+        )
+    )
+    findings, _ = lint(repo)
+    msgs = [f.message for f in findings]
+    assert any("unknown top-level key(s): ['unknown_root']" in m for m in msgs)
+    assert any("incident_minutes must be a positive integer" in m for m in msgs)
+    assert any("unknown key(s) in app: ['extra_app']" in m for m in msgs)
+    assert any("unknown key(s): ['typo_field']" in m for m in msgs)
+    assert any("unknown key(s) in active_hours: ['tz']" in m for m in msgs)
+    assert any("eval_every_minutes (30) must not exceed window_minutes (15)" in m for m in msgs)
+    assert any("threshold (150) must be <= 100.0" in m for m in msgs)
+    assert any("queues must be a non-empty list" in m for m in msgs)
+    assert any("active_hours.days 'funday'" in m for m in msgs)
+    assert any("active_hours.start must be HH:MM" in m for m in msgs)
+    assert "E-DUPLICATE" in codes(findings)

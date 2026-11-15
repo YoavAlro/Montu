@@ -19,6 +19,15 @@ def discover(root: str, pattern_glob: str) -> list[str]:
     )
 
 
+def discover_all(root: str, pattern_globs: tuple[str, ...]) -> list[str]:
+    """Repo-relative paths matching one or more globs, deduplicated and sorted."""
+    found: set[str] = set()
+    for pattern_glob in pattern_globs:
+        for matched in glob.glob(os.path.join(root, pattern_glob)):
+            found.add(os.path.relpath(matched, root))
+    return sorted(found)
+
+
 def extract_units(root: str, sources_glob: str, pattern: str) -> set[str]:
     """Deployable-unit names, extracted by regex from the files the glob discovers.
 
@@ -58,6 +67,7 @@ def identifier_exists(root: str, identifier: str, source_globs: tuple[str, ...])
         ["git", "grep", "-q", "--fixed-strings", identifier, "--", *source_globs],
         cwd=root,
         capture_output=True,
+        check=False,
     )
     return result.returncode == 0
 

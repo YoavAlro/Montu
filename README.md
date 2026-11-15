@@ -144,12 +144,16 @@ required = ["window_minutes", "threshold"]
 tokens = ["marker=request_failed"]   # identifiers this kind's query greps for
 
 # Declaring the built-in kind adds to its fields rather than replacing them.
+# Dotted paths reach into nested mappings (and reject a scalar where a mapping is expected).
 [profiles.<name>.kinds.custom]
-required = ["severity"]
-allowed_values = { severity = ["high", "low"] }   # checked when present (E-VALUE)
-# Fields a particular value obliges. The engine never learns what "high" means —
-# the repo states the rule, the engine only enforces it.
-requires_when = [{ field = "severity", equals = "high", require = ["escalation"] }]
+required = ["severity", "condition.op", "condition.limit"]
+allowed_values = { severity = ["high", "low"], "condition.op" = ["gt", "lt"] }   # E-VALUE
+# Fields a particular value (or presence) obliges. The engine never learns what "high"
+# or "ratio" means — the repo states the rule, the engine only enforces it.
+requires_when = [
+    { field = "severity", equals = "high", require = ["escalation"] },
+    { field = "condition.ratio", present = true, require = ["condition.ratio.num", "condition.ratio.den"] },
+]
 ```
 
 A spec's profile is whichever `spec_glob` discovered it — specs carry no profile field.

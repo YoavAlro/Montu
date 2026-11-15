@@ -25,10 +25,11 @@ class ConfigError(Exception):
 
 @dataclass
 class ValueRule:
-    """Fields an alert must carry only when one of its fields holds a given value."""
+    """Fields an alert must carry when one of its fields holds a value or is set."""
 
     spec_field: str
-    equals: str
+    equals: str | None = None
+    present: bool = False
     require: tuple[str, ...] = ()
 
 
@@ -178,14 +179,18 @@ def _load_profile(name: str, prof: dict) -> Profile:
 def _load_kind(label: str, kind: dict) -> KindSpec:
     rules = []
     for rule in kind.get("requires_when") or []:
-        if not rule.get("field") or rule.get("equals") is None:
+        has_equals = rule.get("equals") is not None
+        has_present = bool(rule.get("present"))
+        if not rule.get("field") or has_equals == has_present:
             raise ConfigError(
-                f"kind {label!r} has a requires_when entry without both field and equals"
+                f"kind {label!r} has a requires_when entry without field and exactly one "
+                "of equals or present"
             )
         rules.append(
             ValueRule(
                 spec_field=rule["field"],
-                equals=str(rule["equals"]),
+                equals=str(rule["equals"]) if has_equals else None,
+                present=has_present,
                 require=tuple(rule.get("require") or ()),
             )
         )

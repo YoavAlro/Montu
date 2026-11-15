@@ -93,7 +93,10 @@ class Linter:
         valid_kinds = set(profile.kinds) | {"custom"}
         builtin_custom = ("name", self.config.custom_query_field, "condition")
         for i, alert in enumerate(alerts):
-            kind = (alert or {}).get("kind")
+            if not isinstance(alert, dict):
+                err(f"alerts[{i}] must be a mapping")
+                continue
+            kind = alert.get("kind")
             if kind not in valid_kinds:
                 err(f"alerts[{i}].kind {kind!r} not in {sorted(valid_kinds)} for profile {profile.name!r}")
                 continue
@@ -103,11 +106,23 @@ class Linter:
                 # The built-in fields are a floor a declared `custom` kind adds to, never
                 # replaces — otherwise declaring one to add a field would silently drop them.
                 required = tuple(dict.fromkeys(builtin_custom + required))
+            reported_prefixes: set[str] = set()
             for field_name in required:
-                if field_name not in alert or alert.get(field_name) is None:
+                if _ancestor_reported(field_name, reported_prefixes):
+                    continue
+                value, type_err = _resolve_field(alert, field_name)
+                if type_err is not None:
+                    prefix = type_err.split(" ", 1)[0]
+                    if prefix not in reported_prefixes:
+                        err(f"alerts[{i}] ({kind}) {type_err}")
+                        reported_prefixes.add(prefix)
+                elif value is None:
                     err(f"alerts[{i}] ({kind}) requires {field_name}")
+                    reported_prefixes.add(field_name)
             if declared is not None:
-                findings.extend(self._check_values(alert, i, kind, declared, rel))
+                findings.extend(
+                    self._check_values(alert, i, kind, declared, rel, reported_prefixes)
+                )
             if not (alert.get("runbook") or "").strip():
                 findings.append(
                     Finding(
@@ -121,16 +136,34 @@ class Linter:
         return findings
 
     def _check_values(
-        self, alert: dict, index: int, kind: str, declared: KindSpec, rel: str
+        self,
+        alert: dict,
+        index: int,
+        kind: str,
+        declared: KindSpec,
+        rel: str,
+        reported_prefixes: set[str],
     ) -> list[Finding]:
-        """A field's permitted values, and the fields a given value makes mandatory.
+        """A field's permitted values, and the fields another field obliges.
 
-        Lets a repo say "this value of that field obliges these other fields" without the
-        engine learning what any of them mean.
+        Lets a repo say "this value (or presence) of that field obliges these other
+        fields" — including dotted paths into structured blocks — without the engine
+        learning what any of them mean.
         """
         findings: list[Finding] = []
+
+        def schema_err(prefix: str, msg: str) -> None:
+            if prefix not in reported_prefixes:
+                findings.append(Finding(rel, "E-SCHEMA", f"alerts[{index}] ({kind}) {msg}"))
+                reported_prefixes.add(prefix)
+
         for spec_field, allowed in declared.allowed_values.items():
-            value = alert.get(spec_field)
+            if _ancestor_reported(spec_field, reported_prefixes):
+                continue
+            value, type_err = _resolve_field(alert, spec_field)
+            if type_err is not None:
+                schema_err(type_err.split(" ", 1)[0], type_err)
+                continue
             if value is None:
                 continue  # presence is `required`'s job, not this check's
             if str(value) not in allowed:
@@ -143,18 +176,38 @@ class Linter:
                     )
                 )
         for rule in declared.requires_when:
-            if str(alert.get(rule.spec_field)) != rule.equals:
+            if _ancestor_reported(rule.spec_field, reported_prefixes):
                 continue
+            gate_val, type_err = _resolve_field(alert, rule.spec_field)
+            if type_err is not None:
+                schema_err(type_err.split(" ", 1)[0], type_err)
+                continue
+            if rule.present:
+                triggered = gate_val is not None
+            else:
+                triggered = gate_val is not None and str(gate_val) == rule.equals
+            if not triggered:
+                continue
+            why = (
+                f"when {rule.spec_field} is set"
+                if rule.present
+                else f"when {rule.spec_field} is {rule.equals!r}"
+            )
             for spec_field in rule.require:
-                if alert.get(spec_field) is None:
+                if _ancestor_reported(spec_field, reported_prefixes):
+                    continue
+                req_val, req_type_err = _resolve_field(alert, spec_field)
+                if req_type_err is not None:
+                    schema_err(req_type_err.split(" ", 1)[0], req_type_err)
+                elif req_val is None:
                     findings.append(
                         Finding(
                             rel,
                             "E-SCHEMA",
-                            f"alerts[{index}] ({kind}) requires {spec_field} when "
-                            f"{rule.spec_field} is {rule.equals!r}",
+                            f"alerts[{index}] ({kind}) requires {spec_field} {why}",
                         )
                     )
+                    reported_prefixes.add(spec_field)
         return findings
 
     def _check_paths(self, app: dict, abs_path: str, rel: str, profile: Profile) -> list[Finding]:
@@ -325,3 +378,30 @@ class Linter:
             if parent == directory:
                 return next(iter(sorted(candidates)), "")
             directory = parent
+
+
+def _resolve_field(mapping: dict, field_path: str) -> tuple[object, str | None]:
+    """Walk a dotted field path across nested mappings.
+
+    Returns (value, type_error). When an intermediate segment is set to a scalar or
+    list instead of a mapping, `type_error` names that segment so a prose string where
+    a structured block was declared fails with E-SCHEMA instead of reading as absent.
+    """
+    current: object = mapping
+    parts = field_path.split(".")
+    for idx, part in enumerate(parts):
+        if not isinstance(current, dict):
+            prefix = ".".join(parts[:idx])
+            return None, f"{prefix} must be a mapping, got {type(current).__name__}"
+        if part not in current:
+            return None, None
+        current = current[part]
+        if current is None:
+            return None, None
+    return current, None
+
+
+def _ancestor_reported(field_path: str, reported: set[str]) -> bool:
+    """True when an ancestor of `field_path` has already produced a schema finding."""
+    parts = field_path.split(".")
+    return any(".".join(parts[:i]) in reported for i in range(1, len(parts)))

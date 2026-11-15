@@ -306,3 +306,85 @@ def test_estate_map_prints_gaps_and_coverage(repo: Path, capsys):
     assert "ghost_cell: UNMONITORED" in out
     assert "widget: src/tools/widget/monitoring.yaml" in out
     assert "1/1 runbooks" in out
+
+
+def test_dotted_field_rules_validate_nested_mappings(repo: Path):
+    """Dotted paths reach into nested blocks; a scalar where a mapping is expected fails once."""
+    (repo / "montu.toml").write_text(
+        MONTU_TOML
+        + textwrap.dedent(
+            """
+            [profiles.plain.kinds.custom]
+            required = ["condition.op", "condition.limit"]
+            allowed_values = { "condition.op" = ["gt", "lt"] }
+            requires_when = [
+                { field = "condition.ratio", present = true, require = ["condition.ratio.num", "condition.ratio.den"] },
+            ]
+            """
+        )
+    )
+    spec = repo / "src" / "tools" / "widget" / "monitoring.yaml"
+
+    def with_custom(block: str) -> str:
+        indented = textwrap.indent(textwrap.dedent(block).strip("\n"), "  ")
+        return PLAIN_SPEC.replace("dashboard: true", f"{indented}\ndashboard: true")
+
+    # A prose string where dotted subfields are required fails once as a non-mapping.
+    spec.write_text(
+        with_custom(
+            """
+            - kind: custom
+              name: slow
+              query: "source logs | filter marker=cell_failed"
+              condition: "count > 5"
+              runbook: check slow
+            """
+        )
+    )
+    findings, _ = lint(repo)
+    schema_msgs = [f.message for f in findings if f.code == "E-SCHEMA"]
+    assert schema_msgs == ["alerts[1] (custom) condition must be a mapping, got str"]
+
+    # Invalid allowed_value on a dotted path -> E-VALUE; present-gated nested subfield missing -> E-SCHEMA.
+    spec.write_text(
+        with_custom(
+            """
+            - kind: custom
+              name: slow
+              query: "source logs | filter marker=cell_failed"
+              condition:
+                op: eq
+                limit: 5
+                ratio:
+                  num: failed
+              runbook: check slow
+            """
+        )
+    )
+    findings, _ = lint(repo)
+    assert any("condition.op 'eq'" in f.message for f in findings if f.code == "E-VALUE")
+    assert any(
+        "requires condition.ratio.den when condition.ratio is set" in f.message
+        for f in findings
+        if f.code == "E-SCHEMA"
+    )
+
+    # Satisfied structured block passes cleanly.
+    spec.write_text(
+        with_custom(
+            """
+            - kind: custom
+              name: slow
+              query: "source logs | filter marker=cell_failed"
+              condition:
+                op: gt
+                limit: 5
+                ratio:
+                  num: failed
+                  den: total
+              runbook: check slow
+            """
+        )
+    )
+    findings, _ = lint(repo)
+    assert [f for f in findings if f.is_error] == []

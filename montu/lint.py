@@ -51,15 +51,17 @@ class Linter:
         seen_names: dict[str, str] = {}
 
         for profile in self.config.profiles.values():
+            if only_paths is None and self.config.strict_keys:
+                for glob_pat in profile.spec_globs:
+                    if not discover(self.config.root, glob_pat):
+                        findings.append(
+                            Finding(
+                                "montu.toml",
+                                "E-SCHEMA",
+                                f"profile {profile.name!r} spec_glob {glob_pat!r} matched 0 files",
+                            )
+                        )
             all_rels = discover_all(self.config.root, profile.spec_globs)
-            if only_paths is None and self.config.strict_keys and not all_rels:
-                findings.append(
-                    Finding(
-                        "montu.toml",
-                        "E-SCHEMA",
-                        f"profile {profile.name!r} spec_glob {list(profile.spec_globs)} matched 0 files",
-                    )
-                )
             spec_rels = (
                 [rel for rel in all_rels if rel in only_paths]
                 if only_paths is not None
@@ -106,7 +108,7 @@ class Linter:
 
         raw_app = spec.get("app")
         app = raw_app if isinstance(raw_app, dict) else {}
-        findings = self._check_schema(spec, raw_app, app, rel, profile, seen_names)
+        findings = self.check_spec_schema(spec, raw_app, app, rel, profile, seen_names)
         findings.extend(self._check_paths(app, abs_path, rel, profile))
         findings.extend(self._check_inventory_and_fields(app, abs_path, rel, profile))
         findings.extend(self._check_unit(app, rel, profile))
@@ -114,7 +116,7 @@ class Linter:
         findings.extend(self._check_file_refs(spec, abs_path, rel, profile))
         return findings
 
-    def _check_schema(
+    def check_spec_schema(
         self,
         spec: dict,
         raw_app: object,
@@ -225,7 +227,8 @@ class Linter:
             self._check_unique_alert_name(
                 spec, app, alert, i, kind, profile, rel, seen_names, findings
             )
-            if not (alert.get("runbook") or "").strip():
+            raw_runbook = alert.get("runbook")
+            if not (raw_runbook.strip() if isinstance(raw_runbook, str) else ""):
                 findings.append(
                     Finding(
                         rel,

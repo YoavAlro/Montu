@@ -53,7 +53,8 @@ def _print_spec_line(config: Config, owner: str, rel: str) -> None:
     for alert in alerts:
         kind = (alert or {}).get("kind", "?")
         kinds.append(alert.get("name") if kind == "custom" else kind)
-        if (alert.get("runbook") or "").strip():
+        raw_rb = (alert or {}).get("runbook")
+        if isinstance(raw_rb, str) and raw_rb.strip():
             with_runbook += 1
     dashboard = "dashboard" if spec.get("dashboard") else "no dashboard"
     print(f"  {owner}: {rel}")
